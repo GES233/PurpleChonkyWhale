@@ -10,7 +10,7 @@ defmodule DarkChonkyWhale.AgentLoop do
   means logged.
   """
 
-  alias DarkChonkyWhale.{Session, Tools}
+  alias DarkChonkyWhale.{Session, ToolResult, Tools}
   alias DarkChonkyWhale.LLM.Client
 
   @default_max_steps 100
@@ -78,17 +78,11 @@ defmodule DarkChonkyWhale.AgentLoop do
 
   defp execute_calls(session, tools, calls) do
     for call <- calls do
-      output =
-        case Tools.execute(tools, call.name, call.arguments) do
-          {:ok, output} -> output
-          {:error, error} -> %{ok: false, error: error}
-        end
+      result = Tools.execute(tools, call.name, call.arguments)
 
       {:ok, _} =
         Session.append(session, :"tool/result", %{
-          "tool_call_id" => call.id,
-          "name" => call.name,
-          "output" => output
+          "message" => ToolResult.from_result(call.id, call.name, result)
         })
     end
 

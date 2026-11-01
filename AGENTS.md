@@ -9,13 +9,14 @@ this tree; nothing is aspirational.
 
 ```sh
 mix compile            # deps are vendored in deps/ (git sparse checkout of GES233/Dexterous)
-mix test               # 82 tests / 1 doctest, ~4s; many runtimes are skipped when absent
+mix test               # 92 tests / 1 doctest, ~4s; many runtimes are skipped when absent
 mix format             # .formatter.exs covers mix.exs, config/, lib/, test/ — NOT examples/
 ```
 
 Note: `mix format --check-formatted` currently fails on
-`lib/dark_chonky_whale/executor/runner.ex` and `.../runtimes/python.ex`
-(formatting drift, not a bug). Running `mix format` fixes those two files only.
+`lib/dark_chonky_whale/executor/runner.ex` and the runtime modules
+`python.ex`, `elixir_subprocess.ex`, and `powershell.ex` (pre-existing
+formatting drift, not a bug). Running `mix format` fixes those four files.
 
 Run things without config: `mix run examples/session_demo.exs` needs no network.
 `examples/smoke_llm.exs`, `examples/agent.exs`, `examples/multi_turn_agent.exs`
@@ -54,8 +55,12 @@ temp file).
 - `LLM` / `LLM.Client` — component and the client consumers get. `:backend`
   defaults to `ReqLLM` and is swapped for a fake in tests.
 - `Sessions` / `Session` — store handle and the append-only JSONL log
-  (`GenServer`). Log owns `seq`/`at`, persists before advancing memory,
-  replays `session-<id>.jsonl` on open, broadcasts every append.
+  (`GenServer`). V1 files have a physical header followed by events with
+  `seq`/`id`/`parent_id`/`at`; headerless v0 files retain their disk shape.
+  The log persists before advancing memory, replays on open, and broadcasts
+  every append.
+- `ToolResult` — converts callback results to the canonical `toolResult`
+  message (`content`, `details`, `isError`) and projects them to ReqLLM.
 - `Tools` — registry + guarded pipeline (`lookup/2`, `schemas/1`,
   `execute/3`); typed results `{:ok, _}` | `{:error, %{type:, message:}}` with
   `:type ∈ {:unknown_tool, :denied, :crashed}`.
@@ -78,13 +83,17 @@ temp file).
   with Access (`env[:cwd]`) because direct callers may pass a keyword list.
 - **A failing process is not a tool error.** Only a timeout is `{:error, _}`
   in the executor; a failing test run comes back `{:ok, output}` with
-  `exit status N`. Always keep this shape.
+  `exit status N`. Its canonical tool result therefore has `isError: false`.
 - **Nothing invalid-UTF-8 may reach JSON.** `Session` scrubs payloads on
   append; `Runner.decode_as/2` transcodes/scrubs console bytes. Tool output is
   persisted as JSON, which would refuse invalid bytes outright.
 - **Model-visible means logged.** The only projection is `Session.messages/1`;
   markers (`turn/start`, `step/start`, …) and unknown event types are durable
   but skipped. Event payloads use **string** keys in `data`.
+- **Tool batches are provider-safe.** Each declared call has at most one result
+  per batch; results project in assistant call order, deferred user/assistant
+  input follows the complete batch, and projecting an unsettled batch raises
+  instead of emitting an invalid provider request.
 - **Plans are plain data; runtimes never touch the filesystem.** A plan is
   `%{exe, args, cwd, script}` where `script` is *content* and the `:script`
   atom marks where its path belongs; `Runner.run/2` writes it to a fresh temp

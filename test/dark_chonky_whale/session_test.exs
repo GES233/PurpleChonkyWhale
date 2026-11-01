@@ -1,7 +1,7 @@
 defmodule DarkChonkyWhale.SessionTest do
   use ExUnit.Case, async: false
 
-  alias DarkChonkyWhale.{Session, Sessions}
+  alias DarkChonkyWhale.{Session, Sessions, ToolResult}
   alias Dexterous.Context
 
   setup do
@@ -18,8 +18,18 @@ defmodule DarkChonkyWhale.SessionTest do
     pid
   end
 
+  defp append_assistant(pid, calls) do
+    Session.append(pid, :"assistant/message", %{
+      "content" => "",
+      "tool_calls" =>
+        Enum.map(calls, fn {id, name} ->
+          %{"id" => id, "name" => name, "input" => %{}}
+        end)
+    })
+  end
+
   describe "the log" do
-    test "append assigns seq and timestamp, in order", %{dir: dir, scope: scope} do
+    test "append assigns the complete envelope, in order", %{dir: dir, scope: scope} do
       pid = open_session(dir, scope, :s1)
 
       {:ok, e1} = Session.append(pid, :"turn/start", %{})
@@ -27,8 +37,31 @@ defmodule DarkChonkyWhale.SessionTest do
 
       assert e1.seq == 0
       assert e2.seq == 1
-      assert %DateTime{} = e1.at
+      assert is_integer(e1.at)
+      assert is_binary(e1.id)
+      assert e1.parent_id == nil
+      assert e2.parent_id == e1.id
       assert [^e1, ^e2] = Session.events(pid)
+    end
+
+    test "v1 writes a physical header outside the event sequence", %{dir: dir, scope: scope} do
+      pid = open_session(dir, scope, :s1)
+      {:ok, event} = Session.append(pid, :"user/message", %{"content" => "hi"})
+
+      [header_line, event_line] =
+        dir |> Path.join("session-s1.jsonl") |> File.stream!() |> Enum.to_list()
+
+      header = Jason.decode!(header_line)
+      stored = Jason.decode!(event_line)
+
+      assert header["type"] == "session"
+      assert header["version"] == 1
+      assert header["id"] == "s1"
+      refute Map.has_key?(header, "seq")
+      assert stored["seq"] == event.seq
+      assert stored["id"] == event.id
+      assert stored["parent_id"] == nil
+      assert is_integer(stored["at"])
     end
 
     test "every append is broadcast as a session/event", %{dir: dir, scope: scope, ctx: ctx} do
@@ -47,46 +80,53 @@ defmodule DarkChonkyWhale.SessionTest do
 
     test "invalid UTF-8 in a payload is scrubbed, never fatal", %{dir: dir, scope: scope} do
       pid = open_session(dir, scope, :gbk)
+      {:ok, _} = append_assistant(pid, [{"call_1", "bash"}])
 
       # GBK-encoded console output, as captured by a tool on a Chinese
       # Windows machine: not valid UTF-8.
       {:ok, event} =
-        Session.append(pid, :"tool/result", %{"name" => "bash", "output" => <<199, 253, 10>>})
+        Session.append(pid, :"tool/result", %{
+          "tool_call_id" => "call_1",
+          "name" => "bash",
+          "output" => <<199, 253, 10>>
+        })
 
       assert Process.alive?(pid)
       assert String.valid?(event.data["output"])
 
       GenServer.stop(pid)
       pid = open_session(dir, scope, :gbk)
-      assert [%{data: %{"output" => output}}] = Session.events(pid)
+      assert [_assistant, %{data: %{"output" => output}}] = Session.events(pid)
       assert String.valid?(output)
     end
 
-    test "reopening the same id replays the on-disk log", %{dir: dir, scope: scope} do
+    test "reopening v1 replays stable event identities", %{dir: dir, scope: scope} do
       pid = open_session(dir, scope, :s1)
-      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "hello"})
-      {:ok, _} = Session.append(pid, :"assistant/message", %{"content" => "hi there"})
+      {:ok, first} = Session.append(pid, :"user/message", %{"content" => "hello"})
+      {:ok, second} = Session.append(pid, :"assistant/message", %{"content" => "hi there"})
       GenServer.stop(pid)
 
       pid = open_session(dir, scope, :s1)
 
-      assert [first, second] = Session.events(pid)
-      assert first.type == :"user/message"
+      assert [^first, ^second] = Session.events(pid)
       assert first.data == %{"content" => "hello"}
       assert second.seq == 1
+      assert second.parent_id == first.id
     end
 
     test "an event type no code references round-trips as a string", %{dir: dir, scope: scope} do
       pid = open_session(dir, scope, :s1)
-      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "hi"})
+      {:ok, first} = Session.append(pid, :"user/message", %{"content" => "hi"})
 
-      # Simulate a future format: a line whose type is unknown to this VM.
+      # Simulate a future format: a valid v1 event whose type is unknown here.
       File.write!(
         Path.join(dir, "session-s1.jsonl"),
         Jason.encode!(%{
           "seq" => 1,
+          "id" => "evt_future",
+          "parent_id" => first.id,
           "type" => "future/thing",
-          "at" => DateTime.to_iso8601(DateTime.utc_now()),
+          "at" => System.system_time(:millisecond),
           "data" => %{}
         }) <> "\n",
         [:append]
@@ -99,6 +139,71 @@ defmodule DarkChonkyWhale.SessionTest do
       # Unknown types are not model-visible.
       assert [%{role: :user}] = Session.messages(pid)
     end
+
+    test "legacy v0 keeps its disk shape and gains the current envelope in memory", %{
+      dir: dir,
+      scope: scope
+    } do
+      File.mkdir_p!(dir)
+      path = Path.join(dir, "session-old.jsonl")
+
+      File.write!(path, [
+        Jason.encode!(%{
+          "seq" => 0,
+          "type" => "user/message",
+          "at" => "2026-01-02T03:04:05Z",
+          "data" => %{"content" => "old"}
+        }) <> "\n"
+      ])
+
+      pid = open_session(dir, scope, :old)
+      assert [legacy] = Session.events(pid)
+      assert legacy.id == "evt_legacy_0"
+      assert legacy.parent_id == nil
+      assert is_integer(legacy.at)
+
+      {:ok, appended} = Session.append(pid, :"user/message", %{"content" => "new"})
+      assert appended.id == "evt_legacy_1"
+      assert appended.parent_id == legacy.id
+      GenServer.stop(pid)
+
+      lines = path |> File.stream!() |> Enum.to_list()
+      assert length(lines) == 2
+      refute Jason.decode!(hd(lines))["type"] == "session"
+
+      stored = Jason.decode!(List.last(lines))
+      assert stored["seq"] == 1
+      refute Map.has_key?(stored, "id")
+      assert is_binary(stored["at"])
+
+      pid = open_session(dir, scope, :old)
+      assert [_legacy, ^appended] = Session.events(pid)
+    end
+
+    test "tool results reject unknown and duplicate calls within a batch", %{
+      dir: dir,
+      scope: scope
+    } do
+      pid = open_session(dir, scope, :s1)
+
+      assert {:error, %{type: :unknown_tool_call}} =
+               Session.append(pid, :"tool/result", %{
+                 "tool_call_id" => "missing",
+                 "name" => "calc",
+                 "output" => "4"
+               })
+
+      {:ok, _} = append_assistant(pid, [{"call_1", "calc"}])
+      result = ToolResult.from_result("call_1", "calc", {:ok, "4"})
+      {:ok, _} = Session.append(pid, :"tool/result", %{"message" => result})
+
+      assert {:error, %{type: :duplicate_tool_result}} =
+               Session.append(pid, :"tool/result", %{"message" => result})
+
+      # Providers are expected to unique ids, but a later batch may reuse one.
+      {:ok, _} = append_assistant(pid, [{"call_1", "calc"}])
+      assert {:ok, _} = Session.append(pid, :"tool/result", %{"message" => result})
+    end
   end
 
   describe "the projection" do
@@ -108,12 +213,7 @@ defmodule DarkChonkyWhale.SessionTest do
       {:ok, _} = Session.append(pid, :"system/message", %{"content" => "be brief"})
       {:ok, _} = Session.append(pid, :"turn/start", %{})
       {:ok, _} = Session.append(pid, :"user/message", %{"content" => "2+2?"})
-
-      {:ok, _} =
-        Session.append(pid, :"assistant/message", %{
-          "content" => "",
-          "tool_calls" => [%{"id" => "call_1", "name" => "calc", "input" => %{"expr" => "2+2"}}]
-        })
+      {:ok, _} = append_assistant(pid, [{"call_1", "calc"}])
 
       {:ok, _} =
         Session.append(pid, :"tool/result", %{
@@ -130,9 +230,89 @@ defmodule DarkChonkyWhale.SessionTest do
       assert user.role == :user
       assert assistant_call.role == :assistant
       assert tool_result.role == :tool
+      assert tool_result.metadata.is_error == false
+      assert [%{type: :text, text: "4"}] = tool_result.content
       assert assistant.role == :assistant
 
       assert [%{type: :text, text: "4"}] = assistant.content
+    end
+
+    test "canonical results preserve JSON success and structured errors", %{
+      dir: dir,
+      scope: scope
+    } do
+      pid = open_session(dir, scope, :s1)
+      {:ok, _} = append_assistant(pid, [{"ok", "calc"}, {"bad", "calc"}])
+
+      {:ok, _} =
+        Session.append(pid, :"tool/result", %{
+          "message" => ToolResult.from_result("ok", "calc", {:ok, %{"answer" => 42}})
+        })
+
+      {:ok, _} =
+        Session.append(pid, :"tool/result", %{
+          "message" =>
+            ToolResult.from_result("bad", "calc", {:error, %{type: :denied, message: "no"}})
+        })
+
+      assert [_assistant, ok, bad] = Session.messages(pid)
+      assert [%{type: :text, text: ~s({"answer":42})}] = ok.content
+      assert ok.metadata.is_error == false
+      assert [%{type: :text, text: "no"}] = bad.content
+      assert bad.metadata.is_error == true
+
+      assert [_assistant, _ok, %{data: %{"message" => bad_event}}] = Session.events(pid)
+      assert bad_event["details"]["error"]["type"] == "denied"
+      assert bad_event["isError"] == true
+    end
+
+    test "tool results precede deferred input and follow assistant call order", %{
+      dir: dir,
+      scope: scope
+    } do
+      pid = open_session(dir, scope, :s1)
+      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "work"})
+      {:ok, _} = append_assistant(pid, [{"c1", "read"}, {"c2", "read"}])
+
+      # Results may settle out of order; steering may arrive before the batch closes.
+      {:ok, _} =
+        Session.append(pid, :"tool/result", %{
+          "message" => ToolResult.from_result("c2", "read", {:ok, "second"})
+        })
+
+      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "steer"})
+
+      {:ok, _} =
+        Session.append(pid, :"tool/result", %{
+          "message" => ToolResult.from_result("c1", "read", {:ok, "first"})
+        })
+
+      {:ok, _} = Session.append(pid, :"assistant/message", %{"content" => "done"})
+
+      assert [user, _call, first, second, steer, assistant] = Session.messages(pid)
+      assert user.role == :user
+      assert first.tool_call_id == "c1"
+      assert second.tool_call_id == "c2"
+      assert steer.role == :user
+      assert [%{type: :text, text: "steer"}] = steer.content
+      assert assistant.role == :assistant
+
+      # The durable chronology is unchanged even though the provider view is reordered.
+      assert Enum.map(Session.events(pid), & &1.type) == [
+               :"user/message",
+               :"assistant/message",
+               :"tool/result",
+               :"user/message",
+               :"tool/result",
+               :"assistant/message"
+             ]
+    end
+
+    test "an unsettled tool batch refuses provider projection", %{dir: dir, scope: scope} do
+      pid = open_session(dir, scope, :s1)
+      {:ok, _} = append_assistant(pid, [{"c1", "read"}])
+
+      assert_raise ArgumentError, ~r/unsettled tool calls/, fn -> Session.messages(pid) end
     end
   end
 

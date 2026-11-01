@@ -3,7 +3,7 @@
 #
 # No network needed; this exercises only the local log and projection.
 
-alias DarkChonkyWhale.{Session, Sessions}
+alias DarkChonkyWhale.{Session, Sessions, ToolResult}
 alias Dexterous.Context
 
 dir = Path.join(System.tmp_dir!(), "dcw-session-demo")
@@ -43,9 +43,7 @@ IO.puts("\n== 2. a turn with a tool call, event by event ==")
 
 {:ok, _} =
   Session.append(session, :"tool/result", %{
-    "tool_call_id" => "call_1",
-    "name" => "calc",
-    "output" => "4"
+    "message" => ToolResult.from_result("call_1", "calc", {:ok, "4"})
   })
 
 {:ok, _} = Session.append(session, :"assistant/message", %{"content" => "2+2 = 4."})
@@ -60,7 +58,9 @@ for message <- Session.messages(session) do
       calls -> " calls=" <> inspect(Enum.map(calls, & &1.function.name))
     end
 
-  IO.puts("  #{String.pad_trailing(to_string(message.role), 9)} #{inspect(message.content)}#{calls}")
+  IO.puts(
+    "  #{String.pad_trailing(to_string(message.role), 9)} #{inspect(message.content)}#{calls}"
+  )
 end
 
 IO.puts("\n== 4. kill the process; the on-disk log survives ==")
