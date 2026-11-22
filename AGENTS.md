@@ -8,8 +8,8 @@ this tree; nothing is aspirational.
 ## Commands
 
 ```sh
-mix compile            # deps are vendored in deps/ (git sparse checkout of GES233/Dexterous)
-mix test               # 100 tests / 1 doctest, ~4.5s; many runtimes are skipped when absent
+mix compile            # deps are vendored under deps/; Dexterous apps come from a sparse checkout
+mix test               # 109 tests / 1 doctest, ~5s; runtimes are skipped when absent
 mix format             # .formatter.exs covers mix.exs, config/, lib/, test/ — NOT examples/
 ```
 
@@ -31,12 +31,24 @@ is given per entry, e.g. in `examples/agent.exs`.
 | `:sessions` | `DarkChonkyWhale.Sessions` (config `:dir` required) | `%Sessions{}` | `session/event` (emit, per append) |
 | `:tools` | `DarkChonkyWhale.Tools` (config `:tools`, `:env`) | `%Tools{}` registry | `tools/pre-execute` (waterfall over `%{name:, arguments:, decision:}`), `tools/post-execute` (emit) |
 
-`DarkChonkyWhale.AgentLoop.run/4` is the driver: `turn/start` → loop of
+`DarkChonkyWhale.AgentLoop.run/4` is the driver: it seals any tool calls left
+unsettled by an interrupted turn, logs `turn/start`, then loops over
 `step/start`, stream via `Client.stream/3`, `assistant/message`, execute each
-tool call through `Tools.execute/3`, `tool/result` → until a final answer or
-`:max_steps_exceeded` (default 100); `turn/end` is appended in an `after` block
-so a dying session cannot mask the real error. The loop keeps **no history of
-its own** — the model's view is exactly `Session.messages/1`.
+tool call through `Tools.execute/3` (a batch runs concurrently, capped by
+`:tool_concurrency`, default `System.schedulers_online()`), `tool/result` —
+until a final answer, `:max_steps_exceeded` (default 100), or a hit on its
+`:should_cancel?` predicate. Its `after` block stops in-flight stream/tool
+tasks, seals dangling calls and appends `turn/end`, so a dying session cannot
+mask the real error. The loop keeps **no history of its own** — the model's
+view is exactly `Session.messages/1`.
+
+`DarkChonkyWhale.AgentRun.start/1` wraps one driver call in a supervised
+`GenServer` (`restart: :temporary`): it binds `session_id`/`run_id` across LLM
+and tool events, writes `run/start` before model work, settles **once** with a
+single `run/{completed,failed,cancelled}` event, and exposes `await/2`,
+`cancel/2` (cooperative stream + subprocess cancellation) and `steer/2`.
+Applications start a default registry and supervisor; a composition may mount
+`AgentRunSupervisor` as its `:runs` component instead.
 
 The executor is a fourth, internal seam: `Tools.Executor` (model-facing
 surface) → `Executor.Runtime` behaviour (`run/2`) → a *plan* → `Executor.Runner`
@@ -48,9 +60,9 @@ temp file).
 - `DarkChonkyWhale` — placeholder `hello/0` + doctest; `Application` starts the
   default `AgentRunRegistry` and `AgentRunSupervisor`.
 - `AgentRun` / `AgentRunSupervisor` — supervised per-execution process and its
-  supervisor/registry (`:runs`). Binds `session_id`/`run_id` across LLM and tool
-  events, logs `run/start` and a single terminal `run/{completed,failed,cancelled}`
-  event, and performs cooperative stream and subprocess cancellation.
+  supervisor/registry (`:runs` when mounted as a component). `start/1`,
+  `await/2`, `cancel/2`, `steer/2`, `status/1`; every run settles at most once,
+  and terminal state is durable even though the process is `:temporary`.
 - `LLM` / `LLM.Client` — component and the client consumers get. `:backend`
   defaults to `ReqLLM` and is swapped for a fake in tests.
 - `Sessions` / `Session` — store handle and the append-only JSONL log
@@ -66,13 +78,14 @@ temp file).
 - `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`.
 - `Tools.{Read, Write, Edit, Glob, Grep, Executor, TodoWrite, Skill, Recompile}` — the built-ins.
   `Tools.Walk` is the shared deterministic, symlink-safe, prune-aware walk and
-  glob compiler used by `glob`/`grep`.
+  glob compiler used by `glob`/`grep`; `TodoWrite` also emits `:"tools/todo"`.
 - `Executor.Runner` — port executor: merges stdout/stderr, treats a settled
   process as a result (`exit status N` appended), kills the whole tree on
   timeout, caps output head+tail, normalizes EOL, transcodes OEM-codepage bytes.
 - `Executor.Runtimes.{Shell, PowerShell, Python, Elixir, ElixirSubprocess}` —
-  each a `Executor.Runtime`; the first four build plans, `Elixir` evaluates
-  in-process with a stand-in group leader capturing IO.
+  each a `Executor.Runtime`; all but `Elixir` build plans (script content plus
+  the `:script` placeholder) for `Runner`, while `Elixir` evaluates in-process
+  with a stand-in group leader capturing IO.
 
 ## Invariants to respect
 
@@ -111,6 +124,9 @@ temp file).
 - `runtime: "elixir"` runs in *this* BEAM: no isolation, side effects are not
   undoable, a timeout only stops the damage. `elixir_subprocess` is the
   isolated one.
+- Agent runs are `restart: :temporary` on purpose: an interrupted run's
+  in-flight tool calls may have unknown side effects, so OTP must never
+  restart it. Resume by starting a new run on the same session log.
 - `recompile` needs `Mix.env() == :dev` under `mix run`; it starts
   `DexterousHMR` lazily and refuses cleanly elsewhere. Tests override it with
   `:dexterous_hmr`'s `:compile_fun` config and must restore "absent" with
