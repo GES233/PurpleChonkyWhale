@@ -34,6 +34,50 @@ defmodule DarkChonkyWhale.ToolResult do
     }
   end
 
+  @doc """
+  Build a synthetic error result for a tool call that was cancelled before its
+  body started (`type: "cancelled"`, `state: "not_started"`).
+  """
+  @spec cancelled(String.t(), String.t(), String.t(), integer()) :: message()
+  def cancelled(
+        tool_call_id,
+        tool_name,
+        reason \\ "tool call cancelled before execution started",
+        timestamp \\ now()
+      ) do
+    from_result(
+      tool_call_id,
+      tool_name,
+      {:error, %{type: :cancelled, state: :not_started, message: reason}},
+      timestamp
+    )
+  end
+
+  @doc """
+  Build a synthetic error result for a tool call that was interrupted after
+  starting (`type: "outcome_unknown"`, `state: "started"`). The model-visible
+  text instructs the model to inspect state before retrying and not to repeat
+  non-idempotent work blindly.
+  """
+  @spec outcome_unknown(String.t(), String.t(), String.t(), integer()) :: message()
+  def outcome_unknown(
+        tool_call_id,
+        tool_name,
+        reason \\ "tool call interrupted after execution started",
+        timestamp \\ now()
+      ) do
+    guidance =
+      "#{reason} — outcome is unknown because execution had already started; " <>
+        "inspect workspace or system state before retrying and do not repeat non-idempotent work blindly."
+
+    from_result(
+      tool_call_id,
+      tool_name,
+      {:error, %{type: :outcome_unknown, state: :started, message: guidance}},
+      timestamp
+    )
+  end
+
   @doc "Normalize a legacy flat `tool/result` payload."
   @spec from_legacy(map(), integer()) :: message()
   def from_legacy(data, timestamp \\ now()) do
@@ -89,10 +133,15 @@ defmodule DarkChonkyWhale.ToolResult do
   defp error_record(reason) when is_map(reason) do
     type = Map.get(reason, :type) || Map.get(reason, "type") || :tool
 
-    %{
+    record = %{
       "type" => to_string(type),
       "message" => error_message(reason)
     }
+
+    case Map.get(reason, :state) || Map.get(reason, "state") do
+      nil -> record
+      state -> Map.put(record, "state", to_string(state))
+    end
   end
 
   defp error_record(reason), do: %{"type" => "tool", "message" => error_message(reason)}

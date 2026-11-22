@@ -27,13 +27,13 @@ defmodule DarkChonkyWhale.Session do
   `seal_unsettled/2` closes an interrupted batch by appending synthetic error
   `:"tool/result"` events for any dangling calls.
 
-  Turn/step markers (`:"turn/start"`, `:"step/start"`, …) and any other type
-  are durable facts but not model-visible. Every append is broadcast on the
-  scope's event bus as `:"session/event"` with `%{session: id, event: event}`.
+  Turn/step markers (`:"turn/start"`, `:"step/start"`, …), run lifecycle events
+  (`:"run/start"`, `:"run/completed"`, `:"run/failed"`, `:"run/cancelled"`),
+  and any other type are durable facts but not model-visible. Every append is
+  broadcast on the scope's event bus as `:"session/event"` with
+  `%{session: id, event: event}`.
 
-  Known gaps versus DSH's session log: no generation chain. Run identity
-  belongs to the later AgentRun layer; canonical results currently have no
-  `runId` field.
+  Known gaps versus DSH's session log: no generation chain.
   """
 
   use GenServer
@@ -62,6 +62,10 @@ defmodule DarkChonkyWhale.Session do
     end
   end
 
+  @doc "Return the session's identifier."
+  @spec id(pid()) :: id()
+  def id(pid), do: GenServer.call(pid, :id)
+
   @doc "Append an event of `type` with `data`. Returns `{:ok, event}` or `{:error, reason}`."
   @spec append(pid(), atom(), map()) :: {:ok, event()} | {:error, map()}
   def append(pid, type, data) when is_atom(type) and is_map(data) do
@@ -81,11 +85,31 @@ defmodule DarkChonkyWhale.Session do
   @doc """
   Seal any unsettled tool calls in the current open batch by appending synthetic
   error `:"tool/result"` events in assistant call order. Returns `{:ok, sealed_events}`.
+
+  Accepts either a binary reason or keyword/map options:
+
+    * `:reason` — human-readable interruption/cancellation reason
+    * `:type` — `:outcome_unknown` (default when `:started_call_ids` is omitted)
+      or `:cancelled`
+    * `:started_call_ids` — collection of call IDs whose execution started;
+      those calls are sealed with `type: "outcome_unknown", state: "started"`,
+      while unstarted calls in the batch are sealed with
+      `type: "cancelled", state: "not_started"`
+    * `:run_id` — optional run identifier bound to the sealed results
   """
-  @spec seal_unsettled(pid(), String.t()) :: {:ok, [event()]}
-  def seal_unsettled(pid, reason \\ "tool call interrupted before completion")
-      when is_binary(reason) do
-    GenServer.call(pid, {:seal_unsettled, reason})
+  @spec seal_unsettled(pid(), String.t() | keyword() | map()) :: {:ok, [event()]}
+  def seal_unsettled(pid, opts \\ [])
+
+  def seal_unsettled(pid, reason) when is_binary(reason) do
+    GenServer.call(pid, {:seal_unsettled, %{reason: reason}})
+  end
+
+  def seal_unsettled(pid, opts) when is_list(opts) do
+    GenServer.call(pid, {:seal_unsettled, Map.new(opts)})
+  end
+
+  def seal_unsettled(pid, opts) when is_map(opts) do
+    GenServer.call(pid, {:seal_unsettled, opts})
   end
 
   ## Server
@@ -119,6 +143,10 @@ defmodule DarkChonkyWhale.Session do
   end
 
   @impl true
+  def handle_call(:id, _from, state) do
+    {:reply, state.id, state}
+  end
+
   def handle_call({:append, type, data}, _from, state) do
     case validate_tool_result(type, data, state) do
       :ok ->
@@ -130,13 +158,31 @@ defmodule DarkChonkyWhale.Session do
     end
   end
 
-  def handle_call({:seal_unsettled, reason}, _from, state) do
-    {sealed_rev, state} =
-      Enum.reduce(state.open_batch, {[], state}, fn {id, name}, {acc, st} ->
-        result =
-          ToolResult.from_result(id, name, {:error, %{type: :interrupted, message: reason}})
+  def handle_call({:seal_unsettled, opts}, _from, state) do
+    reason =
+      Map.get(opts, :reason) || Map.get(opts, "reason") ||
+        "tool call interrupted before completion"
 
-        {event, st} = do_append_event(:"tool/result", %{"message" => result}, st)
+    default_type = Map.get(opts, :type) || Map.get(opts, "type")
+
+    started_ids =
+      normalize_id_set(Map.get(opts, :started_call_ids) || Map.get(opts, "started_call_ids"))
+
+    explicit_run_id = Map.get(opts, :run_id) || Map.get(opts, "run_id")
+
+    {sealed_rev, state} =
+      Enum.reduce(state.open_batch, {[], state}, fn {id, name, call_run_id}, {acc, st} ->
+        result = build_sealed_result(id, name, reason, default_type, started_ids)
+        run_id = explicit_run_id || call_run_id
+
+        payload =
+          if run_id != nil do
+            %{"runId" => to_string(run_id), "message" => result}
+          else
+            %{"message" => result}
+          end
+
+        {event, st} = do_append_event(:"tool/result", payload, st)
         {[event | acc], st}
       end)
 
@@ -145,6 +191,32 @@ defmodule DarkChonkyWhale.Session do
 
   def handle_call(:events, _from, state) do
     {:reply, Enum.reverse(state.events_rev), state}
+  end
+
+  defp normalize_id_set(nil), do: nil
+  defp normalize_id_set(%MapSet{} = set), do: set
+  defp normalize_id_set(list) when is_list(list), do: MapSet.new(list, &to_string/1)
+
+  defp build_sealed_result(id, name, reason, default_type, started_ids) do
+    resolved_type =
+      cond do
+        default_type in [:cancelled, "cancelled"] ->
+          :cancelled
+
+        default_type in [:outcome_unknown, "outcome_unknown"] ->
+          :outcome_unknown
+
+        is_struct(started_ids, MapSet) ->
+          if MapSet.member?(started_ids, to_string(id)), do: :outcome_unknown, else: :cancelled
+
+        true ->
+          :outcome_unknown
+      end
+
+    case resolved_type do
+      :cancelled -> ToolResult.cancelled(id, name, reason)
+      :outcome_unknown -> ToolResult.outcome_unknown(id, name, reason)
+    end
   end
 
   ## Append
@@ -185,12 +257,23 @@ defmodule DarkChonkyWhale.Session do
         {:error, %{type: :unknown_tool_call, message: "tool result has no tool call id"}}
 
       id ->
+        result_run_id = data["runId"] || data["run_id"]
+
         cond do
           MapSet.member?(state.settled, id) ->
             {:error, %{type: :duplicate_tool_result, message: "tool call already settled: #{id}"}}
 
           not Map.has_key?(state.calls, id) ->
             {:error, %{type: :unknown_tool_call, message: "unknown tool call: #{id}"}}
+
+          stale_run_id?(state.calls[id], result_run_id) ->
+            expected = state.calls[id].run_id
+
+            {:error,
+             %{
+               type: :stale_run_result,
+               message: "tool result runId #{result_run_id} does not match call runId #{expected}"
+             }}
 
           true ->
             :ok
@@ -199,6 +282,12 @@ defmodule DarkChonkyWhale.Session do
   end
 
   defp validate_tool_result(_type, _data, _state), do: :ok
+
+  defp stale_run_id?(%{run_id: expected}, actual)
+       when is_binary(expected) and is_binary(actual) and expected != actual,
+       do: true
+
+  defp stale_run_id?(_call_info, _actual), do: false
 
   ## Projection
 
@@ -357,13 +446,21 @@ defmodule DarkChonkyWhale.Session do
   end
 
   defp index_tool_call(:"assistant/message", data, calls, settled, open_batch) do
+    run_id = data["runId"] || data["run_id"]
+
     Enum.reduce(data["tool_calls"] || [], {calls, settled, open_batch}, fn call,
                                                                            {calls, settled,
                                                                             open_batch} ->
       id = call["id"]
       name = call["name"]
-      open_batch = Enum.reject(open_batch, fn {open_id, _} -> open_id == id end) ++ [{id, name}]
-      {Map.put(calls, id, name), MapSet.delete(settled, id), open_batch}
+      call_run_id = call["runId"] || call["run_id"] || run_id
+
+      open_batch =
+        Enum.reject(open_batch, fn {open_id, _, _} -> open_id == id end) ++
+          [{id, name, call_run_id}]
+
+      {Map.put(calls, id, %{name: name, run_id: call_run_id}), MapSet.delete(settled, id),
+       open_batch}
     end)
   end
 
@@ -373,7 +470,7 @@ defmodule DarkChonkyWhale.Session do
         {calls, settled, open_batch}
 
       id ->
-        open_batch = Enum.reject(open_batch, fn {open_id, _} -> open_id == id end)
+        open_batch = Enum.reject(open_batch, fn {open_id, _, _} -> open_id == id end)
         {calls, MapSet.put(settled, id), open_batch}
     end
   end

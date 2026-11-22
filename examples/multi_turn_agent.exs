@@ -11,6 +11,8 @@
 # starting with "/" is a command:
 #
 #   /quit, /exit     end the session
+#   /cancel          cancel the currently active AgentRun
+#   /steer TEXT      inject a steering message into the active AgentRun
 #   /reset           start a fresh session log (the old one stays on disk)
 #   /sessions        list saved session ids on disk
 #   /resume ID       switch to (or open) session ID
@@ -23,7 +25,7 @@
 # The terminal rendering is driven entirely by the seam events: `llm/chunk`
 # streams the answer, `tools/post-execute` reports each tool call.
 
-alias DarkChonkyWhale.{AgentLoop, LLM, Session, Sessions, Tools}
+alias DarkChonkyWhale.{AgentRun, LLM, Session, Sessions, Tools}
 alias DarkChonkyWhale.Executor.Runtimes.Shell
 alias Dexterous.Context
 alias DexterousLoader.Entry
@@ -219,66 +221,142 @@ fresh_id = fn -> "multi-#{System.unique_integer([:positive])}" end
 {session_id, session} = open.(opts[:session] || fresh_id.())
 
 IO.puts(
-  "model: #{model}\ncwd: #{cwd}\nsession: #{session_id}\nturn 1 — enter a task ('/quit' to leave, '/sessions' to list, '/resume ID' to switch)\n---"
+  "model: #{model}\ncwd: #{cwd}\nsession: #{session_id}\nturn 1 — enter a task ('/quit' to leave, '/cancel' to stop run, '/steer TEXT' to steer, '/sessions' to list, '/resume ID' to switch)\n---"
 )
 
-# The REPL. `IO.gets` returns :eof when stdin closes, which ends the loop.
-loop = fn loop, {session_id, session} ->
-  case IO.gets("\n> ") do
+# Spawn a dedicated stdin reader so `/cancel` and `/steer` can be processed
+# while an AgentRun is actively executing.
+repl_pid = self()
+
+spawn_link(fn ->
+  read_loop = fn read_loop ->
+    case IO.gets("\n> ") do
+      :eof ->
+        send(repl_pid, :stdin_eof)
+
+      {:error, _} ->
+        send(repl_pid, :stdin_eof)
+
+      line ->
+        send(repl_pid, {:stdin_line, String.trim(line)})
+        read_loop.(read_loop)
+    end
+  end
+
+  read_loop.(read_loop)
+end)
+
+await_active_run = fn await_active_run, run_pid, run_id, pending_lines, eof? ->
+  receive do
+    {:run_finished, ^run_id, outcome} ->
+      case outcome do
+        {:ok, _text} -> IO.puts("\n== turn complete (#{run_id}) ==")
+        {:error, {:cancelled, reason}} -> IO.puts("\n== turn cancelled (#{run_id}): #{inspect(reason)} ==")
+        {:error, error} -> IO.puts("\n== turn failed (#{run_id}): #{inspect(error)} ==")
+      end
+
+      {Enum.reverse(pending_lines), eof?}
+
+    {:stdin_line, "/cancel"} ->
+      IO.puts("\n[cancelling #{run_id}...]")
+      Task.start(fn -> AgentRun.cancel(run_pid, "cancelled by user") end)
+      await_active_run.(await_active_run, run_pid, run_id, pending_lines, eof?)
+
+    {:stdin_line, "/steer " <> steer_text} ->
+      steer_text = String.trim(steer_text)
+
+      if steer_text != "" do
+        {:ok, _} = AgentRun.steer(run_pid, steer_text)
+        IO.puts("\n[steered into #{run_id}]")
+      end
+
+      await_active_run.(await_active_run, run_pid, run_id, pending_lines, eof?)
+
+    {:stdin_line, ""} ->
+      await_active_run.(await_active_run, run_pid, run_id, pending_lines, eof?)
+
+    {:stdin_line, other} ->
+      await_active_run.(await_active_run, run_pid, run_id, [other | pending_lines], eof?)
+
+    :stdin_eof ->
+      await_active_run.(await_active_run, run_pid, run_id, pending_lines, true)
+  end
+end
+
+next_line = fn
+  [head | rest], eof? -> {:line, head, rest, eof?}
+  [], true -> :eof
+  [], false ->
+    receive do
+      {:stdin_line, line} -> {:line, line, [], false}
+      :stdin_eof -> :eof
+    end
+end
+
+loop = fn loop, {session_id, session}, queue, eof? ->
+  case next_line.(queue, eof?) do
     :eof ->
       IO.puts("\n(input closed — bye)")
       :ok
 
-    {:error, _} ->
+    {:line, "", rest, eof?} ->
+      loop.(loop, {session_id, session}, rest, eof?)
+
+    {:line, cmd, _rest, _eof?} when cmd in ["/quit", "/exit"] ->
+      IO.puts("bye (session: #{session_id})")
       :ok
 
-    line ->
-      case String.trim(line) do
-        "" ->
-          loop.(loop, {session_id, session})
+    {:line, "/cancel", rest, eof?} ->
+      IO.puts("[no active run to cancel]")
+      loop.(loop, {session_id, session}, rest, eof?)
 
-        cmd when cmd in ["/quit", "/exit"] ->
-          IO.puts("bye (session: #{session_id})")
-          :ok
+    {:line, "/reset", rest, eof?} ->
+      {new_id, new_session} = open.(fresh_id.())
+      IO.puts("[reset — switched to fresh session #{new_id}]")
+      loop.(loop, {new_id, new_session}, rest, eof?)
 
-        "/reset" ->
-          {new_id, new_session} = open.(fresh_id.())
-          IO.puts("[reset — switched to fresh session #{new_id}]")
-          loop.(loop, {new_id, new_session})
+    {:line, "/sessions", rest, eof?} ->
+      ids = Sessions.list(sessions) |> Enum.sort()
+      IO.puts("[saved sessions (#{length(ids)}): #{Enum.join(ids, ", ")}]")
+      loop.(loop, {session_id, session}, rest, eof?)
 
-        "/sessions" ->
-          ids = Sessions.list(sessions) |> Enum.sort()
-          IO.puts("[saved sessions (#{length(ids)}): #{Enum.join(ids, ", ")}]")
-          loop.(loop, {session_id, session})
+    {:line, "/resume " <> target_id, rest, eof?} ->
+      target_id = String.trim(target_id)
 
-        "/resume " <> target_id ->
-          target_id = String.trim(target_id)
-
-          if target_id == "" do
-            IO.puts("[usage: /resume SESSION_ID]")
-            loop.(loop, {session_id, session})
-          else
-            {resumed_id, resumed} = open.(target_id)
-            count = length(Session.messages(resumed))
-            IO.puts("[resumed session #{resumed_id} (#{count} model-visible messages)]")
-            loop.(loop, {resumed_id, resumed})
-          end
-
-        "/log" ->
-          IO.puts("[session #{session_id}: #{length(Session.messages(session))} model-visible messages so far]")
-          loop.(loop, {session_id, session})
-
-        message ->
-          {:ok, _} = Session.append(session, :"user/message", %{"content" => message})
-
-          case AgentLoop.run(llm, session, tools) do
-            {:ok, _text} -> IO.puts("\n== turn complete ==")
-            {:error, error} -> IO.puts("\n== turn failed: #{inspect(error)} ==")
-          end
-
-          loop.(loop, {session_id, session})
+      if target_id == "" do
+        IO.puts("[usage: /resume SESSION_ID]")
+        loop.(loop, {session_id, session}, rest, eof?)
+      else
+        {resumed_id, resumed} = open.(target_id)
+        count = length(Session.messages(resumed))
+        IO.puts("[resumed session #{resumed_id} (#{count} model-visible messages)]")
+        loop.(loop, {resumed_id, resumed}, rest, eof?)
       end
+
+    {:line, "/log", rest, eof?} ->
+      IO.puts("[session #{session_id}: #{length(Session.messages(session))} model-visible messages so far]")
+      loop.(loop, {session_id, session}, rest, eof?)
+
+    {:line, message, rest, eof?} ->
+      {:ok, run_pid, run_id} =
+        AgentRun.start(
+          session: session,
+          session_id: session_id,
+          client: llm,
+          tools: tools,
+          prompt: message
+        )
+
+      Task.start(fn ->
+        outcome = AgentRun.await(run_pid)
+        send(repl_pid, {:run_finished, run_id, outcome})
+      end)
+
+      {queued_after, eof_after?} =
+        await_active_run.(await_active_run, run_pid, run_id, Enum.reverse(rest), eof?)
+
+      loop.(loop, {session_id, session}, queued_after, eof_after?)
   end
 end
 
-loop.(loop, {session_id, session})
+loop.(loop, {session_id, session}, [], false)

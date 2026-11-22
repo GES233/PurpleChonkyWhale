@@ -315,37 +315,86 @@ defmodule DarkChonkyWhale.SessionTest do
       assert_raise ArgumentError, ~r/unsettled tool calls/, fn -> Session.messages(pid) end
     end
 
-    test "seal_unsettled/2 closes dangling tool calls so an interrupted session can project", %{
-      dir: dir,
-      scope: scope
-    } do
+    test "seal_unsettled/2 distinguishes started (outcome_unknown) vs not_started (cancelled) calls and binds runId",
+         %{
+           dir: dir,
+           scope: scope
+         } do
       pid = open_session(dir, scope, :interrupted)
-      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "read both"})
-      {:ok, _} = append_assistant(pid, [{"c1", "read"}, {"c2", "read"}])
+      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "read all three"})
+      {:ok, _} = append_assistant(pid, [{"c1", "read"}, {"c2", "write"}, {"c3", "read"}])
 
       {:ok, _} =
         Session.append(pid, :"tool/result", %{
+          "runId" => "run_1",
           "message" => ToolResult.from_result("c1", "read", {:ok, "first file"})
         })
 
-      # Simulate a crash and reopen with c2 still unsettled on disk.
+      # Simulate a crash and reopen with c2 (started) and c3 (not started) still unsettled.
       GenServer.stop(pid)
       pid = open_session(dir, scope, :interrupted)
 
-      assert_raise ArgumentError, ~r/unsettled tool calls: c2/, fn -> Session.messages(pid) end
+      assert_raise ArgumentError, ~r/unsettled tool calls: c2, c3/, fn ->
+        Session.messages(pid)
+      end
 
-      assert {:ok, [sealed]} = Session.seal_unsettled(pid, "turn aborted")
-      assert sealed.type == :"tool/result"
-      assert sealed.data["message"]["toolCallId"] == "c2"
-      assert sealed.data["message"]["isError"] == true
-      assert sealed.data["message"]["details"]["error"]["type"] == "interrupted"
+      assert {:ok, [sealed_c2, sealed_c3]} =
+               Session.seal_unsettled(pid,
+                 reason: "turn aborted",
+                 started_call_ids: ["c2"],
+                 run_id: "run_1"
+               )
 
-      assert [_user, _assistant, r1, r2] = Session.messages(pid)
+      assert sealed_c2.type == :"tool/result"
+      assert sealed_c2.data["runId"] == "run_1"
+      assert sealed_c2.data["message"]["toolCallId"] == "c2"
+      assert sealed_c2.data["message"]["isError"] == true
+      assert sealed_c2.data["message"]["details"]["error"]["type"] == "outcome_unknown"
+      assert sealed_c2.data["message"]["details"]["error"]["state"] == "started"
+
+      assert sealed_c3.type == :"tool/result"
+      assert sealed_c3.data["runId"] == "run_1"
+      assert sealed_c3.data["message"]["toolCallId"] == "c3"
+      assert sealed_c3.data["message"]["isError"] == true
+      assert sealed_c3.data["message"]["details"]["error"]["type"] == "cancelled"
+      assert sealed_c3.data["message"]["details"]["error"]["state"] == "not_started"
+
+      assert [_user, _assistant, r1, r2, r3] = Session.messages(pid)
       assert r1.tool_call_id == "c1"
       assert r1.metadata.is_error == false
       assert r2.tool_call_id == "c2"
       assert r2.metadata.is_error == true
-      assert [%{type: :text, text: "turn aborted"}] = r2.content
+      assert [%{type: :text, text: r2_text}] = r2.content
+      assert r2_text =~ "do not repeat non-idempotent work blindly"
+      assert r3.tool_call_id == "c3"
+      assert r3.metadata.is_error == true
+      assert [%{type: :text, text: "turn aborted"}] = r3.content
+    end
+
+    test "rejects a late tool/result carrying a stale runId from an older run", %{
+      dir: dir,
+      scope: scope
+    } do
+      pid = open_session(dir, scope, :stale_run)
+
+      {:ok, _} =
+        Session.append(pid, :"assistant/message", %{
+          "runId" => "run_new",
+          "content" => "",
+          "tool_calls" => [%{"id" => "call_1", "name" => "read", "input" => %{}}]
+        })
+
+      assert {:error, %{type: :stale_run_result}} =
+               Session.append(pid, :"tool/result", %{
+                 "runId" => "run_old",
+                 "message" => ToolResult.from_result("call_1", "read", {:ok, "stale"})
+               })
+
+      assert {:ok, _} =
+               Session.append(pid, :"tool/result", %{
+                 "runId" => "run_new",
+                 "message" => ToolResult.from_result("call_1", "read", {:ok, "fresh"})
+               })
     end
 
     test "assistant thinking and signed reasoning_details round-trip through disk and projection",

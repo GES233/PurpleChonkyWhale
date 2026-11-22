@@ -109,7 +109,13 @@ defmodule DarkChonkyWhale.Tools.TodoWrite do
 
       scope ->
         ctx = Context.new(scope)
-        Context.emit(ctx, @todo_event, %{todos: todos})
+
+        Context.emit(ctx, @todo_event, %{
+          todos: todos,
+          session_id: env[:session_id],
+          run_id: env[:run_id],
+          tool_call_id: env[:tool_call_id]
+        })
     end
   end
 

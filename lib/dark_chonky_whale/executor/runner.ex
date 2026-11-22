@@ -20,7 +20,10 @@ defmodule DarkChonkyWhale.Executor.Runner do
   of a broken tool. Only a process that outlives its timeout is an error —
   it is killed (the whole tree: `taskkill /T` on Windows, a `pgrep` walk on
   POSIX) and what it printed so far is reported — so a wedged process
-  (waiting on a prompt, serving a port) cannot wedge the turn.
+  (waiting on a prompt, serving a port) cannot wedge the turn. The same
+  process-tree cleanup runs when the caller is cancelled or exits abnormally
+  while a child process is still live, while leaving already-settled
+  processes untouched.
 
   Output is capped: the head and the tail are kept and the middle is
   replaced by a byte count, so one runaway process cannot flood the session
@@ -66,7 +69,7 @@ defmodule DarkChonkyWhale.Executor.Runner do
   def run(plan, ctx) do
     with {:ok, plan, script_dir} <- materialize(plan) do
       try do
-        exec(plan, ctx.cwd, ctx.env, ctx.timeout_ms, ctx.max_output_bytes)
+        exec(plan, ctx.cwd, ctx.env, ctx.timeout_ms, ctx.max_output_bytes, script_dir)
       after
         if script_dir, do: File.rm_rf(script_dir)
       end
@@ -112,10 +115,29 @@ defmodule DarkChonkyWhale.Executor.Runner do
 
   ## The run
 
-  defp exec(plan, cwd, env, timeout_ms, max_bytes) do
+  defp exec(plan, cwd, env, timeout_ms, max_bytes, script_dir) do
     case open(plan, cwd, env) do
-      {:ok, port} -> collect(port, fresh(), deadline(timeout_ms), timeout_ms, max_bytes)
-      {:error, message} -> {:error, message}
+      {:ok, port, os_pid} ->
+        old_trap = Process.flag(:trap_exit, true)
+        settled_ref = make_ref()
+        Process.put(settled_ref, false)
+        watcher = spawn_watcher(self(), port, os_pid, script_dir)
+
+        try do
+          collect(port, os_pid, settled_ref, fresh(), deadline(timeout_ms), timeout_ms, max_bytes)
+        after
+          disarm_watcher(watcher)
+          settled? = Process.delete(settled_ref) == true
+
+          if not settled? do
+            cleanup_unsettled(port, os_pid)
+          end
+
+          Process.flag(:trap_exit, old_trap)
+        end
+
+      {:error, message} ->
+        {:error, message}
     end
   end
 
@@ -138,7 +160,14 @@ defmodule DarkChonkyWhale.Executor.Runner do
     # A port is linked to whoever opened it, and a crashing child must not
     # take the turn down with it.
     Process.unlink(port)
-    {:ok, port}
+
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} -> pid
+        _other -> nil
+      end
+
+    {:ok, port, os_pid}
   rescue
     exception -> {:error, "cannot start #{plan.exe}: #{Exception.message(exception)}"}
   end
@@ -161,27 +190,42 @@ defmodule DarkChonkyWhale.Executor.Runner do
 
   defp fresh, do: %{head: "", tail: "", total: 0}
 
-  defp collect(port, acc, deadline_at, timeout_ms, max_bytes) do
+  defp collect(port, os_pid, settled_ref, acc, deadline_at, timeout_ms, max_bytes) do
     remaining = max(deadline_at - System.monotonic_time(:millisecond), 0)
 
     receive do
       {^port, {:data, data}} ->
-        collect(port, absorb(acc, data, max_bytes), deadline_at, timeout_ms, max_bytes)
+        collect(
+          port,
+          os_pid,
+          settled_ref,
+          absorb(acc, data, max_bytes),
+          deadline_at,
+          timeout_ms,
+          max_bytes
+        )
 
       {^port, {:exit_status, status}} ->
         # The exit message follows the child's last write, but a straggler
-        # may still be in flight.
+        # may still be in flight. Mark settled before draining/closing so the
+        # cleanup path never kills an already-settled process.
+        Process.put(settled_ref, true)
         acc = drain(port, acc, max_bytes, deadline(0))
         close(port)
         flush(port)
         {:ok, render(acc, status)}
+
+      {:EXIT, _from, reason} when reason != :normal ->
+        exit(reason)
     after
-      remaining -> timed_out(port, acc, timeout_ms, max_bytes)
+      remaining ->
+        timed_out(port, os_pid, settled_ref, acc, timeout_ms, max_bytes)
     end
   end
 
-  defp timed_out(port, acc, timeout_ms, max_bytes) do
-    kill(port)
+  defp timed_out(port, os_pid, settled_ref, acc, timeout_ms, max_bytes) do
+    Process.put(settled_ref, true)
+    kill(port, os_pid)
     # Give the dying process a moment to flush what it already wrote.
     acc = drain(port, acc, max_bytes, deadline(@kill_grace_ms))
     close(port)
@@ -193,10 +237,73 @@ defmodule DarkChonkyWhale.Executor.Runner do
     {:error, if(body == "", do: message, else: message <> "\n" <> body)}
   end
 
-  defp kill(port) do
+  defp cleanup_unsettled(port, os_pid) do
+    # Distinguish a process that exited right as the caller was interrupted
+    # from one that is still live.
+    exited_in_mailbox? =
+      receive do
+        {^port, {:exit_status, _status}} -> true
+      after
+        0 -> false
+      end
+
+    if not exited_in_mailbox? do
+      kill(port, os_pid)
+    end
+
+    close(port)
+    flush(port)
+  end
+
+  # A lightweight companion process monitors the caller so that even an
+  # untrappable `:kill` exit on the caller process cleans up a still-live OS
+  # process tree and temporary script directory.
+  defp spawn_watcher(caller, port, os_pid, script_dir) do
+    spawn(fn ->
+      ref = Process.monitor(caller)
+
+      receive do
+        {:disarm, ^caller, ack} ->
+          Process.demonitor(ref, [:flush])
+          send(caller, {:disarmed, ack})
+
+        {:DOWN, ^ref, :process, ^caller, _reason} ->
+          kill(port, os_pid)
+          close(port)
+          if script_dir, do: File.rm_rf(script_dir)
+      end
+    end)
+  end
+
+  defp disarm_watcher(watcher) when is_pid(watcher) do
+    ack = make_ref()
+    mref = Process.monitor(watcher)
+    send(watcher, {:disarm, self(), ack})
+
+    receive do
+      {:disarmed, ^ack} ->
+        Process.demonitor(mref, [:flush])
+        :ok
+
+      {:DOWN, ^mref, :process, ^watcher, _reason} ->
+        :ok
+    after
+      1_000 ->
+        Process.demonitor(mref, [:flush])
+        :ok
+    end
+  end
+
+  defp kill(port, fallback_os_pid) do
     case Port.info(port, :os_pid) do
-      {:os_pid, pid} -> kill_os(pid)
-      _other -> :ok
+      {:os_pid, pid} ->
+        kill_os(pid)
+
+      _other when is_integer(fallback_os_pid) ->
+        kill_os(fallback_os_pid)
+
+      _other ->
+        :ok
     end
   end
 

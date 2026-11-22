@@ -45,8 +45,12 @@ temp file).
 
 ## Module map
 
-- `DarkChonkyWhale` — placeholder `hello/0` + doctest; `Application` starts an
-  empty supervisor (components are not started there).
+- `DarkChonkyWhale` — placeholder `hello/0` + doctest; `Application` starts the
+  default `AgentRunRegistry` and `AgentRunSupervisor`.
+- `AgentRun` / `AgentRunSupervisor` — supervised per-execution process and its
+  supervisor/registry (`:runs`). Binds `session_id`/`run_id` across LLM and tool
+  events, logs `run/start` and a single terminal `run/{completed,failed,cancelled}`
+  event, and performs cooperative stream and subprocess cancellation.
 - `LLM` / `LLM.Client` — component and the client consumers get. `:backend`
   defaults to `ReqLLM` and is swapped for a fake in tests.
 - `Sessions` / `Session` — store handle and the append-only JSONL log
