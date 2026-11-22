@@ -56,6 +56,8 @@ ctx = Dexterous.root()
           Tools.Glob,
           Tools.Grep,
           Tools.Executor,
+          Tools.TodoWrite,
+          Tools.Skill,
           Tools.Recompile
         ],
         env: %{cwd: cwd, watch_dirs: [Path.join(cwd, "lib")]}

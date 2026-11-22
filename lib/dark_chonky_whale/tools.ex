@@ -93,7 +93,8 @@ defmodule DarkChonkyWhale.Tools do
     result =
       with {:ok, module} <- lookup(registry, call.name) do
         try do
-          module.execute(call.arguments, registry.env)
+          env = Map.put_new(registry.env, :scope, registry.scope)
+          module.execute(call.arguments, env)
         rescue
           exception -> {:error, %{type: :crashed, message: Exception.message(exception)}}
         catch

@@ -39,6 +39,8 @@ a composition wants in the `:tools` component's config.
 | `glob` | `DarkChonkyWhale.Tools.Glob` | Find files by pattern (`*`, `?`, `**`) |
 | `grep` | `DarkChonkyWhale.Tools.Grep` | Search file contents by regex |
 | `execute` | `DarkChonkyWhale.Tools.Executor` | Run code in a runtime (shell command, PowerShell, Python, Elixir) with a timeout and an output cap |
+| `todo_write` | `DarkChonkyWhale.Tools.TodoWrite` | Record and update the multi-step task checklist |
+| `skill` | `DarkChonkyWhale.Tools.Skill` | Discover and load `SKILL.md` instruction packages on demand |
 | `recompile` | `DarkChonkyWhale.Tools.Recompile` | Recompile and hot-swap changed modules (dev only, via `dexterous_hmr`) |
 
 `glob` and `grep` share `DarkChonkyWhale.Tools.Walk`: a deterministic,

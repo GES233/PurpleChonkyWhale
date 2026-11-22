@@ -60,7 +60,7 @@ temp file).
   `execute/3`); typed results `{:ok, _}` | `{:error, %{type:, message:}}` with
   `:type ∈ {:unknown_tool, :denied, :crashed}`.
 - `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`.
-- `Tools.{Read, Write, Edit, Glob, Grep, Executor, Recompile}` — the built-ins.
+- `Tools.{Read, Write, Edit, Glob, Grep, Executor, TodoWrite, Skill, Recompile}` — the built-ins.
   `Tools.Walk` is the shared deterministic, symlink-safe, prune-aware walk and
   glob compiler used by `glob`/`grep`.
 - `Executor.Runner` — port executor: merges stdout/stderr, treats a settled

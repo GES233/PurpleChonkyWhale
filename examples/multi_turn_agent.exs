@@ -1,16 +1,19 @@
 # A multi-turn headless agent: many turns against one session log, so the
 # model keeps its context (and its tool history) between prompts.
 #
-#   mix run examples/multi_turn_agent.exs -- [--cwd PATH] [model]
+#   mix run examples/multi_turn_agent.exs -- [--cwd PATH] [--session ID] [model]
 #
 # `--cwd` changes the agent's workspace without changing the directory that
 # hosts this Mix project. Relative paths are resolved from the launch cwd.
+# `--session` opens (or resumes) a named session log in ~/.dark_chonky_whale/sessions.
 #
 # Each line read from stdin is one turn. Blank lines are ignored. A line
 # starting with "/" is a command:
 #
 #   /quit, /exit     end the session
 #   /reset           start a fresh session log (the old one stays on disk)
+#   /sessions        list saved session ids on disk
+#   /resume ID       switch to (or open) session ID
 #   /log             print the model-visible message count
 #
 # Anything else is a user message; the agent works the turn with the file
@@ -29,8 +32,9 @@ usage = """
 usage: mix run examples/multi_turn_agent.exs -- [options] [model]
 
 Options:
-  --cwd PATH, -c PATH  use PATH as the agent's working directory
-  --help, -h           show this help
+  --cwd PATH, -c PATH        use PATH as the agent's working directory
+  --session ID, -s ID        open or resume session ID
+  --help, -h                 show this help
 
 The model defaults to deepseek:deepseek-flash. Relative working directories
 are resolved from the directory where mix run was started.
@@ -38,8 +42,8 @@ are resolved from the directory where mix run was started.
 
 {opts, args, invalid} =
   OptionParser.parse(System.argv(),
-    strict: [cwd: :string, help: :boolean],
-    aliases: [c: :cwd, h: :help]
+    strict: [cwd: :string, session: :string, help: :boolean],
+    aliases: [c: :cwd, s: :session, h: :help]
   )
 
 fail = fn message ->
@@ -71,7 +75,9 @@ tool_modules = [
   Tools.Edit,
   Tools.Glob,
   Tools.Grep,
-  Tools.Executor
+  Tools.Executor,
+  Tools.TodoWrite,
+  Tools.Skill
 ]
 
 {tool_modules, tool_env} =
@@ -81,7 +87,11 @@ tool_modules = [
     {tool_modules, %{cwd: cwd}}
   end
 
-dir = Path.join(System.tmp_dir!(), "dcw-multi-turn-sessions")
+dir =
+  Path.join(
+    System.user_home() || System.tmp_dir!(),
+    ".dark_chonky_whale/sessions"
+  )
 
 ctx = Dexterous.root()
 
@@ -92,6 +102,22 @@ ctx = Dexterous.root()
       :thinking -> IO.write(IO.ANSI.faint() <> chunk.text <> IO.ANSI.reset())
       _ -> :ok
     end
+  end)
+
+{:ok, _} =
+  Context.on(ctx, :"tools/todo", fn %{todos: todos} ->
+    IO.puts("\n[todos]")
+
+    Enum.each(todos, fn %{content: content, status: status} ->
+      marker =
+        case status do
+          "completed" -> IO.ANSI.green() <> "[x]" <> IO.ANSI.reset()
+          "in_progress" -> IO.ANSI.yellow() <> "[>]" <> IO.ANSI.reset()
+          _ -> IO.ANSI.faint() <> "[ ]" <> IO.ANSI.reset()
+        end
+
+      IO.puts("  #{marker} #{content}")
+    end)
   end)
 
 {:ok, _} =
@@ -162,33 +188,42 @@ workspace_instructions =
     end
   end) || ""
 
+skills_section = Tools.Skill.prompt_section(tool_env)
+
 system = """
 You are a coding agent working in #{cwd}. Use the read/write/edit/glob/grep
-tools to inspect and modify files, and execute to run the tests, git or a
-build.
+tools to inspect and modify files, todo_write to plan and track multi-step
+work, and execute to run the tests, git or a build.
 The default `execute` (`runtime: "shell"`) runs in: #{shell_description}.
 #{validation_instruction}
 This is a multi-turn conversation: earlier turns are in your context, so build
 on what you already learned instead of re-investigating from scratch.
-When a turn's task is done, answer briefly without calling tools.#{workspace_instructions}
+When a turn's task is done, answer briefly without calling tools.#{workspace_instructions}#{skills_section}
 """
 
-# Open a fresh session log and seed it with the system message. Each turn
-# appends to this same log; the agent's memory is nothing but the log.
-open = fn ->
-  {:ok, session} =
-    Sessions.open(sessions, "multi-#{System.unique_integer([:positive])}")
+# Open or resume a session log. A brand-new log is seeded with the system
+# message; an existing log keeps its history intact and seals any interrupted
+# tool calls from an earlier run.
+open = fn id ->
+  {:ok, session} = Sessions.open(sessions, id)
+  {:ok, _} = Session.seal_unsettled(session)
 
-  {:ok, _} = Session.append(session, :"system/message", %{"content" => system})
-  session
+  if Session.events(session) == [] do
+    {:ok, _} = Session.append(session, :"system/message", %{"content" => system})
+  end
+
+  {id, session}
 end
 
-session = open.()
+fresh_id = fn -> "multi-#{System.unique_integer([:positive])}" end
+{session_id, session} = open.(opts[:session] || fresh_id.())
 
-IO.puts("model: #{model}\ncwd: #{cwd}\nturn 1 — enter a task ('/quit' to leave)\n---")
+IO.puts(
+  "model: #{model}\ncwd: #{cwd}\nsession: #{session_id}\nturn 1 — enter a task ('/quit' to leave, '/sessions' to list, '/resume ID' to switch)\n---"
+)
 
 # The REPL. `IO.gets` returns :eof when stdin closes, which ends the loop.
-loop = fn loop, session ->
+loop = fn loop, {session_id, session} ->
   case IO.gets("\n> ") do
     :eof ->
       IO.puts("\n(input closed — bye)")
@@ -200,20 +235,38 @@ loop = fn loop, session ->
     line ->
       case String.trim(line) do
         "" ->
-          loop.(loop, session)
+          loop.(loop, {session_id, session})
 
         cmd when cmd in ["/quit", "/exit"] ->
-          IO.puts("bye")
+          IO.puts("bye (session: #{session_id})")
           :ok
 
         "/reset" ->
-          # A new log: the model's context starts empty (system prompt aside).
-          IO.puts("[reset — a fresh session log]")
-          loop.(loop, open.())
+          {new_id, new_session} = open.(fresh_id.())
+          IO.puts("[reset — switched to fresh session #{new_id}]")
+          loop.(loop, {new_id, new_session})
+
+        "/sessions" ->
+          ids = Sessions.list(sessions) |> Enum.sort()
+          IO.puts("[saved sessions (#{length(ids)}): #{Enum.join(ids, ", ")}]")
+          loop.(loop, {session_id, session})
+
+        "/resume " <> target_id ->
+          target_id = String.trim(target_id)
+
+          if target_id == "" do
+            IO.puts("[usage: /resume SESSION_ID]")
+            loop.(loop, {session_id, session})
+          else
+            {resumed_id, resumed} = open.(target_id)
+            count = length(Session.messages(resumed))
+            IO.puts("[resumed session #{resumed_id} (#{count} model-visible messages)]")
+            loop.(loop, {resumed_id, resumed})
+          end
 
         "/log" ->
-          IO.puts("[#{length(Session.messages(session))} model-visible messages so far]")
-          loop.(loop, session)
+          IO.puts("[session #{session_id}: #{length(Session.messages(session))} model-visible messages so far]")
+          loop.(loop, {session_id, session})
 
         message ->
           {:ok, _} = Session.append(session, :"user/message", %{"content" => message})
@@ -223,9 +276,9 @@ loop = fn loop, session ->
             {:error, error} -> IO.puts("\n== turn failed: #{inspect(error)} ==")
           end
 
-          loop.(loop, session)
+          loop.(loop, {session_id, session})
       end
   end
 end
 
-loop.(loop, session)
+loop.(loop, {session_id, session})
