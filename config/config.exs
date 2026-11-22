@@ -1,6 +1,9 @@
 import Config
 
-config :req_llm, warn_unverified_models: false
+config :req_llm,
+  warn_unverified_models: false,
+  receive_timeout: 180_000,
+  stream_receive_timeout: 180_000
 
 # Codepagex compiles its mapping tables; only the ones a shell's output can
 # plausibly arrive in are worth the beam size. These are the Windows OEM/ANSI

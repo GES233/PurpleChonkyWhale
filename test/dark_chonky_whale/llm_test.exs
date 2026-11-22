@@ -87,6 +87,64 @@ defmodule DarkChonkyWhale.LLMTest do
     assert_received {:usage, %{usage: %{input_tokens: 1, output_tokens: 2}}}
   end
 
+  describe "relay and compat normalization" do
+    test "anthropic base_url strips trailing /v1 and promotes bearer api_key to oauth access_token" do
+      {_model, opts} =
+        LLM.normalize_config(
+          model: "anthropic:claude-sonnet-4-5",
+          base_url: "https://relay.example.com/api/anthropic/v1/",
+          api_key: "sk-relay-123",
+          auth_mode: :bearer
+        )
+
+      assert opts[:base_url] == "https://relay.example.com/api/anthropic"
+      assert opts[:auth_mode] == :oauth
+      assert opts[:access_token] == "sk-relay-123"
+    end
+
+    test "google custom base_url defaults google_auth_header: true for relay compatibility" do
+      {_model, opts} =
+        LLM.normalize_config(
+          model: "google:gemini-2.5-pro",
+          base_url: "https://relay.example.com/v1beta/",
+          api_key: "sk-google-relay"
+        )
+
+      assert opts[:base_url] == "https://relay.example.com/v1beta"
+      assert opts[:provider_options][:google_auth_header] == true
+    end
+
+    test "google_vertex custom base_url + api_key adapts via access_token, project_id, and on_finch_request" do
+      {_model, opts} =
+        LLM.normalize_config(
+          model: "google_vertex:claude-sonnet-4-5@20250929",
+          base_url: "https://vertex-relay.example.com:8443/vertex",
+          api_key: "sk-vertex-relay"
+        )
+
+      assert opts[:access_token] == "sk-vertex-relay"
+      assert opts[:project_id] == "default"
+      refute Keyword.has_key?(opts, :base_url)
+      assert is_function(opts[:on_finch_request], 1)
+
+      finch_req =
+        Finch.build(
+          :post,
+          "https://aiplatform.googleapis.com/v1/projects/default/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict",
+          [],
+          "{}"
+        )
+
+      rewritten = opts[:on_finch_request].(finch_req)
+      assert rewritten.scheme == :https
+      assert rewritten.host == "vertex-relay.example.com"
+      assert rewritten.port == 8443
+
+      assert rewritten.path ==
+               "/vertex/v1/projects/default/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict"
+    end
+  end
+
   defp eventually(fun, attempts \\ 50)
   defp eventually(_fun, 0), do: nil
 

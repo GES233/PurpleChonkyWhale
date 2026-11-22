@@ -15,23 +15,25 @@ defmodule DarkChonkyWhale.Session do
 
     * `:"system/message"` — `%{content}`
     * `:"user/message"` — `%{content}`
-    * `:"assistant/message"` — `%{content, tool_calls: [%{id, name, input}]}`
-      (`tool_calls` optional)
+    * `:"assistant/message"` — `%{content, thinking, reasoning_details, tool_calls: [%{id, name, input, metadata}]}`
+      (`thinking`, `reasoning_details`, and `tool_calls` optional)
     * `:"tool/result"` — canonical `%{"message" => toolResult}` or the legacy
       flat `%{tool_call_id, name, output}` payload
 
   An assistant tool-call batch is indivisible in the provider projection:
   results are emitted in assistant call order, and messages that arrived while
   the batch was open are emitted after its results. Projecting an unsettled
-  batch raises rather than sending an invalid conversation to a provider.
+  batch raises rather than sending an invalid conversation to a provider;
+  `seal_unsettled/2` closes an interrupted batch by appending synthetic error
+  `:"tool/result"` events for any dangling calls.
 
   Turn/step markers (`:"turn/start"`, `:"step/start"`, …) and any other type
   are durable facts but not model-visible. Every append is broadcast on the
   scope's event bus as `:"session/event"` with `%{session: id, event: event}`.
 
-  Known gaps versus DSH's session log: no generation chain, interrupted-tail
-  sealing, or assistant reasoning preservation. Run identity belongs to the
-  later AgentRun layer; canonical results currently have no `runId` field.
+  Known gaps versus DSH's session log: no generation chain. Run identity
+  belongs to the later AgentRun layer; canonical results currently have no
+  `runId` field.
   """
 
   use GenServer
@@ -76,6 +78,16 @@ defmodule DarkChonkyWhale.Session do
     pid |> events() |> project_events()
   end
 
+  @doc """
+  Seal any unsettled tool calls in the current open batch by appending synthetic
+  error `:"tool/result"` events in assistant call order. Returns `{:ok, sealed_events}`.
+  """
+  @spec seal_unsettled(pid(), String.t()) :: {:ok, [event()]}
+  def seal_unsettled(pid, reason \\ "tool call interrupted before completion")
+      when is_binary(reason) do
+    GenServer.call(pid, {:seal_unsettled, reason})
+  end
+
   ## Server
 
   @impl true
@@ -87,7 +99,7 @@ defmodule DarkChonkyWhale.Session do
     path = Path.join(dir, "session-#{id}.jsonl")
 
     {header, events, format, persisted?} = read_back(path, id, opts)
-    {calls, settled} = index_tool_calls(events)
+    {calls, settled, open_batch} = index_tool_calls(events)
 
     {:ok,
      %{
@@ -100,6 +112,7 @@ defmodule DarkChonkyWhale.Session do
        last_event_id: events |> List.last() |> then(&(&1 && &1.id)),
        calls: calls,
        settled: settled,
+       open_batch: open_batch,
        format: format,
        persisted?: persisted?
      }}
@@ -108,9 +121,26 @@ defmodule DarkChonkyWhale.Session do
   @impl true
   def handle_call({:append, type, data}, _from, state) do
     case validate_tool_result(type, data, state) do
-      :ok -> append_event(type, data, state)
-      {:error, _reason} = error -> {:reply, error, state}
+      :ok ->
+        {event, state} = do_append_event(type, data, state)
+        {:reply, {:ok, event}, state}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
     end
+  end
+
+  def handle_call({:seal_unsettled, reason}, _from, state) do
+    {sealed_rev, state} =
+      Enum.reduce(state.open_batch, {[], state}, fn {id, name}, {acc, st} ->
+        result =
+          ToolResult.from_result(id, name, {:error, %{type: :interrupted, message: reason}})
+
+        {event, st} = do_append_event(:"tool/result", %{"message" => result}, st)
+        {[event | acc], st}
+      end)
+
+    {:reply, {:ok, Enum.reverse(sealed_rev)}, state}
   end
 
   def handle_call(:events, _from, state) do
@@ -119,7 +149,7 @@ defmodule DarkChonkyWhale.Session do
 
   ## Append
 
-  defp append_event(type, data, state) do
+  defp do_append_event(type, data, state) do
     event = %{
       seq: state.next_seq,
       id: event_id(state.format, state.next_seq),
@@ -131,7 +161,9 @@ defmodule DarkChonkyWhale.Session do
 
     persist!(state, event)
     broadcast(state.scope, state.id, event)
-    {calls, settled} = index_tool_call(type, event.data, state.calls, state.settled)
+
+    {calls, settled, open_batch} =
+      index_tool_call(type, event.data, state.calls, state.settled, state.open_batch)
 
     state = %{
       state
@@ -140,10 +172,11 @@ defmodule DarkChonkyWhale.Session do
         last_event_id: event.id,
         calls: calls,
         settled: settled,
+        open_batch: open_batch,
         persisted?: true
     }
 
-    {:reply, {:ok, event}, state}
+    {event, state}
   end
 
   defp validate_tool_result(:"tool/result", data, state) do
@@ -173,7 +206,8 @@ defmodule DarkChonkyWhale.Session do
     {messages_rev, batch} = Enum.reduce(events, {[], nil}, &project_event/2)
 
     if batch do
-      raise ArgumentError, "cannot project unsettled tool calls: #{Enum.join(batch.ids, ", ")}"
+      unsettled = Enum.reject(batch.ids, &Map.has_key?(batch.results, &1))
+      raise ArgumentError, "cannot project unsettled tool calls: #{Enum.join(unsettled, ", ")}"
     end
 
     Enum.reverse(messages_rev)
@@ -231,12 +265,80 @@ defmodule DarkChonkyWhale.Session do
   defp project_message(%{type: :"assistant/message", data: data}) do
     tool_calls =
       for call <- data["tool_calls"] || [] do
-        {call["name"], call["input"], [id: call["id"]]}
+        project_tool_call(call)
       end
 
-    message = ReqLLM.Context.assistant(data["content"] || "", tool_calls: tool_calls)
+    message =
+      (data["content"] || "")
+      |> ReqLLM.Context.assistant(tool_calls: tool_calls)
+      |> maybe_project_thinking(data["thinking"])
+      |> maybe_project_reasoning_details(data["reasoning_details"])
+
     ids = Enum.map(data["tool_calls"] || [], & &1["id"])
     {message, ids}
+  end
+
+  defp project_tool_call(call) do
+    input = call["input"] || %{}
+    args_json = if is_binary(input), do: input, else: Jason.encode!(input)
+    tc = ReqLLM.ToolCall.new(call["id"], call["name"], args_json)
+
+    case call["metadata"] do
+      meta when is_map(meta) and map_size(meta) > 0 ->
+        ReqLLM.ToolCall.put_metadata(tc, atomize_known_metadata_keys(meta))
+
+      _ ->
+        tc
+    end
+  end
+
+  defp atomize_known_metadata_keys(meta) do
+    Map.new(meta, fn
+      {"thought_signature", v} -> {:thought_signature, v}
+      {"signature", v} -> {:signature, v}
+      {k, v} -> {k, v}
+    end)
+  end
+
+  defp maybe_project_thinking(message, thinking) when is_binary(thinking) and thinking != "" do
+    %{message | content: message.content ++ [ReqLLM.Message.ContentPart.thinking(thinking)]}
+  end
+
+  defp maybe_project_thinking(message, _thinking), do: message
+
+  defp maybe_project_reasoning_details(message, details)
+       when is_list(details) and details != [] do
+    decoded =
+      details
+      |> Enum.with_index()
+      |> Enum.map(fn {item, idx} -> decode_reasoning_detail(item, idx) end)
+
+    %{message | reasoning_details: decoded}
+  end
+
+  defp maybe_project_reasoning_details(message, _details), do: message
+
+  defp decode_reasoning_detail(%ReqLLM.Message.ReasoningDetails{} = detail, _idx), do: detail
+
+  defp decode_reasoning_detail(item, fallback_idx) when is_map(item) do
+    %ReqLLM.Message.ReasoningDetails{
+      text: item["text"] || item[:text],
+      signature: item["signature"] || item[:signature],
+      encrypted?: (item["encrypted"] || item[:encrypted?] || item["signature_encrypted"]) == true,
+      provider: decode_provider_atom(item["provider"] || item[:provider]),
+      format: item["format"] || item[:format],
+      index: item["index"] || item[:index] || fallback_idx,
+      provider_data: item["provider_data"] || item[:provider_data] || %{}
+    }
+  end
+
+  defp decode_provider_atom(nil), do: nil
+  defp decode_provider_atom(provider) when is_atom(provider), do: provider
+
+  defp decode_provider_atom(provider) when is_binary(provider) do
+    String.to_existing_atom(provider)
+  rescue
+    ArgumentError -> nil
   end
 
   defp canonical_result(%{"message" => %{"role" => "toolResult"}} = data, _at),
@@ -249,25 +351,35 @@ defmodule DarkChonkyWhale.Session do
   ## Tool-call index
 
   defp index_tool_calls(events) do
-    Enum.reduce(events, {%{}, MapSet.new()}, fn event, {calls, settled} ->
-      index_tool_call(event.type, event.data, calls, settled)
+    Enum.reduce(events, {%{}, MapSet.new(), []}, fn event, {calls, settled, open_batch} ->
+      index_tool_call(event.type, event.data, calls, settled, open_batch)
     end)
   end
 
-  defp index_tool_call(:"assistant/message", data, calls, settled) do
-    Enum.reduce(data["tool_calls"] || [], {calls, settled}, fn call, {calls, settled} ->
-      {Map.put(calls, call["id"], call["name"]), MapSet.delete(settled, call["id"])}
+  defp index_tool_call(:"assistant/message", data, calls, settled, open_batch) do
+    Enum.reduce(data["tool_calls"] || [], {calls, settled, open_batch}, fn call,
+                                                                           {calls, settled,
+                                                                            open_batch} ->
+      id = call["id"]
+      name = call["name"]
+      open_batch = Enum.reject(open_batch, fn {open_id, _} -> open_id == id end) ++ [{id, name}]
+      {Map.put(calls, id, name), MapSet.delete(settled, id), open_batch}
     end)
   end
 
-  defp index_tool_call(:"tool/result", data, calls, settled) do
+  defp index_tool_call(:"tool/result", data, calls, settled, open_batch) do
     case ToolResult.call_id(data) do
-      nil -> {calls, settled}
-      id -> {calls, MapSet.put(settled, id)}
+      nil ->
+        {calls, settled, open_batch}
+
+      id ->
+        open_batch = Enum.reject(open_batch, fn {open_id, _} -> open_id == id end)
+        {calls, MapSet.put(settled, id), open_batch}
     end
   end
 
-  defp index_tool_call(_type, _data, calls, settled), do: {calls, settled}
+  defp index_tool_call(_type, _data, calls, settled, open_batch),
+    do: {calls, settled, open_batch}
 
   ## Persistence
 

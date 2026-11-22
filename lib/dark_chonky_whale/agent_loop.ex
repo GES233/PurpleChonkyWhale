@@ -12,12 +12,17 @@ defmodule DarkChonkyWhale.AgentLoop do
 
   alias DarkChonkyWhale.{Session, ToolResult, Tools}
   alias DarkChonkyWhale.LLM.Client
+  alias ReqLLM.Message.ReasoningDetails
+  alias ReqLLM.Provider.ChunkAccumulator
+  alias ReqLLM.{StreamChunk, StreamResponse, ToolCall}
 
   @default_max_steps 100
 
   @doc """
-  Run one turn: `:"turn/start"`, the step loop, then `:"turn/end"` (appended
-  even when the loop errors). Returns `{:ok, final_text}` or `{:error, _}`.
+  Run one turn: seals any unsettled tool calls from an earlier interrupted
+  turn, logs `:"turn/start"`, runs the step loop, then seals any mid-turn
+  interrupted calls and logs `:"turn/end"` (even when the loop errors).
+  Returns `{:ok, final_text}` or `{:error, _}`.
 
   Options:
 
@@ -26,6 +31,7 @@ defmodule DarkChonkyWhale.AgentLoop do
   @spec run(Client.t(), pid(), Tools.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
   def run(%Client{} = client, session, %Tools{} = tools, opts \\ []) do
     max_steps = Keyword.get(opts, :max_steps, @default_max_steps)
+    {:ok, _} = Session.seal_unsettled(session)
     {:ok, _} = Session.append(session, :"turn/start", %{})
 
     try do
@@ -34,6 +40,7 @@ defmodule DarkChonkyWhale.AgentLoop do
       # Best-effort bookkeeping: if the session died mid-turn, the original
       # error must not be masked by a failure to close the turn.
       try do
+        Session.seal_unsettled(session)
         Session.append(session, :"turn/end", %{})
       catch
         :exit, _ -> :ok
@@ -47,10 +54,9 @@ defmodule DarkChonkyWhale.AgentLoop do
     {:ok, _} = Session.append(session, :"step/start", %{"n" => n})
 
     with {:ok, tool_specs} <- tool_specs(tools),
-         {:ok, response} <- Client.stream(client, Session.messages(session), tools: tool_specs) do
-      response
-      |> ReqLLM.StreamResponse.classify()
-      |> settle(client, session, tools, max_steps, n)
+         {:ok, response} <- Client.stream(client, Session.messages(session), tools: tool_specs),
+         {:ok, classified} <- consume_stream(response) do
+      settle(classified, client, session, tools, max_steps, n)
     end
   end
 
@@ -65,26 +71,179 @@ defmodule DarkChonkyWhale.AgentLoop do
     steps(client, session, tools, max_steps, n + 1)
   end
 
+  defp consume_stream(%StreamResponse{stream: stream, model: model} = response) do
+    try do
+      chunks = Enum.to_list(stream)
+      acc = ChunkAccumulator.reduce(ChunkAccumulator.new(), chunks)
+
+      text = ChunkAccumulator.finalize_text(acc)
+      thinking = ChunkAccumulator.finalize_thinking(acc)
+      tool_calls = ChunkAccumulator.finalize_tool_calls_for_response(acc)
+      finish_reason = ChunkAccumulator.finalize_finish_reason(acc)
+      reasoning_details = extract_reasoning_details(acc, chunks, model)
+
+      actionable_tool_calls = Enum.reject(tool_calls, &ToolCall.flagged_builtin?/1)
+
+      type =
+        if actionable_tool_calls != [] or
+             finish_reason in [:tool_calls, "tool_calls", :tool_use, "tool_use"] do
+          :tool_calls
+        else
+          :final_answer
+        end
+
+      {:ok,
+       %{
+         type: type,
+         text: text,
+         thinking: thinking,
+         reasoning_details: reasoning_details,
+         tool_calls: tool_calls
+       }}
+    rescue
+      error in [ReqLLM.Error.API.Stream, ReqLLM.Error.API.Request, ReqLLM.Error.API.Timeout] ->
+        {:error, error}
+    after
+      if response.metadata_handle, do: StreamResponse.close(response)
+    end
+  end
+
+  defp extract_reasoning_details(acc, chunks, model) do
+    case ChunkAccumulator.finalize_reasoning_details(acc) do
+      details when is_list(details) and details != [] ->
+        details
+
+      _ ->
+        extract_reasoning_from_thinking_chunks(chunks, provider_of(model))
+    end
+  end
+
+  defp extract_reasoning_from_thinking_chunks(chunks, provider) do
+    thinking_chunks =
+      Enum.filter(chunks, fn
+        %StreamChunk{type: :thinking} -> true
+        _ -> false
+      end)
+
+    case thinking_chunks do
+      [] ->
+        []
+
+      list ->
+        text = Enum.map_join(list, "", &(&1.text || ""))
+
+        merged_meta =
+          Enum.reduce(list, %{}, fn %StreamChunk{metadata: meta}, acc ->
+            Map.merge(acc, meta || %{})
+          end)
+
+        signature = merged_meta[:signature] || merged_meta["signature"]
+
+        if signature != nil or Map.has_key?(merged_meta, :provider) do
+          [
+            %ReasoningDetails{
+              text: text,
+              signature: signature,
+              encrypted?: (merged_meta[:encrypted?] || signature != nil) == true,
+              provider: merged_meta[:provider] || provider,
+              format: merged_meta[:format],
+              index: 0,
+              provider_data: merged_meta[:provider_data] || %{}
+            }
+          ]
+        else
+          []
+        end
+    end
+  end
+
+  defp provider_of(%{provider: provider}) when is_atom(provider), do: provider
+  defp provider_of(_model), do: nil
+
   defp append_assistant(session, result) do
-    {:ok, _} =
-      Session.append(session, :"assistant/message", %{
+    data =
+      %{
         "content" => result.text,
         "tool_calls" =>
           Enum.map(result.tool_calls, fn call ->
             %{"id" => call.id, "name" => call.name, "input" => call.arguments}
+            |> maybe_put_call_metadata(Map.get(call, :metadata))
           end)
-      })
+      }
+      |> maybe_put_thinking(Map.get(result, :thinking))
+      |> maybe_put_reasoning_details(Map.get(result, :reasoning_details))
+
+    {:ok, _} = Session.append(session, :"assistant/message", data)
+  end
+
+  defp maybe_put_call_metadata(map, meta) when is_map(meta) and map_size(meta) > 0 do
+    Map.put(map, "metadata", stringify_keys(meta))
+  end
+
+  defp maybe_put_call_metadata(map, _meta), do: map
+
+  defp maybe_put_thinking(map, thinking) when is_binary(thinking) and thinking != "" do
+    Map.put(map, "thinking", thinking)
+  end
+
+  defp maybe_put_thinking(map, _thinking), do: map
+
+  defp maybe_put_reasoning_details(map, details) when is_list(details) and details != [] do
+    Map.put(map, "reasoning_details", Enum.map(details, &encode_reasoning_detail/1))
+  end
+
+  defp maybe_put_reasoning_details(map, _details), do: map
+
+  defp encode_reasoning_detail(%ReasoningDetails{} = detail) do
+    %{
+      "text" => detail.text,
+      "signature" => detail.signature,
+      "encrypted" => detail.encrypted? == true,
+      "provider" => detail.provider && to_string(detail.provider),
+      "format" => detail.format,
+      "index" => detail.index || 0,
+      "provider_data" => stringify_keys(detail.provider_data || %{})
+    }
+  end
+
+  defp encode_reasoning_detail(detail) when is_map(detail), do: stringify_keys(detail)
+
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn
+      {k, v} when is_atom(k) -> {Atom.to_string(k), stringify_keys(v)}
+      {k, v} -> {to_string(k), stringify_keys(v)}
+    end)
+  end
+
+  defp stringify_keys(list) when is_list(list), do: Enum.map(list, &stringify_keys/1)
+  defp stringify_keys(other), do: other
+
+  defp execute_calls(_session, _tools, []), do: :ok
+
+  defp execute_calls(session, tools, [call]) do
+    result = Tools.execute(tools, call.name, call.arguments)
+    append_tool_result(session, call, result)
   end
 
   defp execute_calls(session, tools, calls) do
-    for call <- calls do
-      result = Tools.execute(tools, call.name, call.arguments)
+    calls
+    |> Task.async_stream(
+      fn call -> {call, Tools.execute(tools, call.name, call.arguments)} end,
+      timeout: :infinity,
+      ordered: true
+    )
+    |> Enum.each(fn {:ok, {call, result}} ->
+      append_tool_result(session, call, result)
+    end)
 
-      {:ok, _} =
-        Session.append(session, :"tool/result", %{
-          "message" => ToolResult.from_result(call.id, call.name, result)
-        })
-    end
+    :ok
+  end
+
+  defp append_tool_result(session, call, result) do
+    {:ok, _} =
+      Session.append(session, :"tool/result", %{
+        "message" => ToolResult.from_result(call.id, call.name, result)
+      })
 
     :ok
   end

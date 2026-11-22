@@ -26,7 +26,9 @@ defmodule DarkChonkyWhale.Tools.Glob do
         "Find files whose path matches a glob pattern. Supported wildcards: " <>
           "`*` (within a path segment), `?` (one character) and `**` (any " <>
           "number of directories). A pattern without a `/` matches the file " <>
-          "name at any depth; results are relative to the working directory.",
+          "name at any depth; results are ordered shallowest-first and " <>
+          "relative to the working directory. Pass `max_depth: 1` to list " <>
+          "only files directly in `path`.",
       parameters: %{
         "type" => "object",
         "properties" => %{
@@ -34,6 +36,11 @@ defmodule DarkChonkyWhale.Tools.Glob do
           "path" => %{
             "type" => "string",
             "description" => "Directory to search. Default: the working directory."
+          },
+          "max_depth" => %{
+            "type" => "integer",
+            "description" =>
+              "Optional maximum directory depth relative to `path` (1 = top-level files only)."
           },
           "limit" => %{
             "type" => "integer",
@@ -60,13 +67,21 @@ defmodule DarkChonkyWhale.Tools.Glob do
         _other -> @default_limit
       end
 
+    max_depth =
+      case Map.get(args, "max_depth") do
+        n when is_integer(n) and n > 0 -> n
+        _other -> nil
+      end
+
     with :ok <- validate_dir(base) do
       regex = Walk.compile_glob(pattern)
 
       matches =
         base
         |> Walk.files(env)
+        |> Enum.filter(&within_depth?(&1, base, max_depth))
         |> Enum.filter(&Walk.glob_match?(regex, pattern, &1, base))
+        |> Enum.sort_by(fn path -> {depth(path, base), Walk.relative(path, cwd(env))} end)
         |> Enum.map(&Walk.relative(&1, cwd(env)))
 
       {:ok, render(base, matches, limit)}
@@ -76,6 +91,16 @@ defmodule DarkChonkyWhale.Tools.Glob do
   def execute(_args, _env), do: {:error, "pattern is a required string"}
 
   defp cwd(env), do: env[:cwd] || File.cwd!()
+
+  defp within_depth?(_path, _base, nil), do: true
+  defp within_depth?(path, base, max_depth), do: depth(path, base) <= max_depth
+
+  defp depth(path, base) do
+    path
+    |> Walk.relative(base)
+    |> String.split("/")
+    |> length()
+  end
 
   defp validate_dir(base) do
     case File.stat(base) do

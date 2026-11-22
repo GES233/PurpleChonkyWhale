@@ -44,7 +44,12 @@ defmodule DarkChonkyWhale.Executor.Runtimes.Python do
   # The script goes to the runner as content, with the `:script` atom where
   # its path belongs in the argument vector.
   defp script_plan(exe, base_args, code) do
-    %{exe: exe, args: base_args ++ [:script], cwd: nil, script: %{name: "script.py", content: code}}
+    %{
+      exe: exe,
+      args: base_args ++ [:script],
+      cwd: nil,
+      script: %{name: "script.py", content: code}
+    }
   end
 
   # The composition's :shell_env wins over the pin (Map.put_new), so a

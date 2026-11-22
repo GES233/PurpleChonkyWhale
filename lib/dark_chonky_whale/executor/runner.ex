@@ -85,7 +85,12 @@ defmodule DarkChonkyWhale.Executor.Runner do
 
     with :ok <- File.mkdir_p(dir),
          :ok <- File.write(path, content) do
-      args = Enum.map(plan.args, fn :script -> path; arg -> arg end)
+      args =
+        Enum.map(plan.args, fn
+          :script -> path
+          arg -> arg
+        end)
+
       cwd = if plan.cwd == :script, do: dir, else: plan.cwd
       {:ok, %{plan | args: args, cwd: cwd}, dir}
     else

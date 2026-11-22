@@ -7,6 +7,7 @@
 # below is driven entirely by the seam events (llm/chunk, tools/*).
 
 alias DarkChonkyWhale.{AgentLoop, LLM, Session, Sessions, Tools}
+alias DarkChonkyWhale.Executor.Runtimes.Shell
 alias Dexterous.Context
 alias DexterousLoader.Entry
 
@@ -88,6 +89,7 @@ tools = await.(:tools)
     You are a one-shot coding agent. The working directory is #{cwd}.
     Use the read/write/edit/glob/grep tools to inspect and modify files, and
     execute to run the tests, git or a build.
+    The default `execute` (`runtime: "shell"`) runs in: #{Shell.describe(%{cwd: cwd})}.
     After editing source files under lib/, call recompile to hot-swap them.
     When the task is done, answer briefly without calling tools.
     """

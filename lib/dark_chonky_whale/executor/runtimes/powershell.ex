@@ -55,7 +55,12 @@ defmodule DarkChonkyWhale.Executor.Runtimes.PowerShell do
   defp script_plan(exe, base_args, code) do
     body = "\uFEFF[Console]::OutputEncoding = [Text.Encoding]::UTF8\r\n" <> crlf(code) <> "\r\n"
 
-    %{exe: exe, args: base_args ++ ["-File", :script], cwd: nil, script: %{name: "script.ps1", content: body}}
+    %{
+      exe: exe,
+      args: base_args ++ ["-File", :script],
+      cwd: nil,
+      script: %{name: "script.ps1", content: body}
+    }
   end
 
   defp crlf(text), do: text |> String.replace("\r\n", "\n") |> String.replace("\n", "\r\n")

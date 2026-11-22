@@ -50,6 +50,34 @@ defmodule DarkChonkyWhale.Executor.Runtimes.Shell do
     end
   end
 
+  @doc """
+  Human-readable description of the shell selected for `env`, suitable for
+  system prompts so the model knows whether `runtime: "shell"` runs POSIX
+  bash/sh or Windows `cmd.exe`.
+  """
+  @spec describe(map() | keyword()) :: String.t()
+  def describe(env \\ %{}) do
+    env = if is_list(env), do: Map.new(env), else: env
+    {program, _args} = shell(env)
+
+    exe =
+      case executable(program) do
+        {:ok, path} -> path
+        {:error, _} -> program
+      end
+
+    case {:os.type(), posix_shell?(exe), cmd?(exe)} do
+      {{:win32, _}, true, _} ->
+        "POSIX #{shell_name(exe)} (#{exe} on Windows host — use POSIX syntax such as `ls -la`, not cmd.exe flags like `dir /b`; use `runtime: \"powershell\"` when PowerShell is needed)"
+
+      {{:win32, _}, _, true} ->
+        "Windows cmd.exe (#{exe} — use `runtime: \"powershell\"` for non-trivial scripts)"
+
+      _ ->
+        "POSIX #{shell_name(exe)} (#{exe})"
+    end
+  end
+
   ## How the command reaches the shell
 
   # A plan is what to spawn: the executable, the argument vector, an optional

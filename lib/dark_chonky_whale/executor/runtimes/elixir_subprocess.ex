@@ -35,7 +35,12 @@ defmodule DarkChonkyWhale.Executor.Runtimes.ElixirSubprocess do
   # The script goes to the runner as content, with the `:script` atom where
   # its path belongs in the argument vector.
   defp script_plan(exe, base_args, code) do
-    %{exe: exe, args: base_args ++ [:script], cwd: nil, script: %{name: "script.exs", content: code}}
+    %{
+      exe: exe,
+      args: base_args ++ [:script],
+      cwd: nil,
+      script: %{name: "script.exs", content: code}
+    }
   end
 
   defp executable(program) do

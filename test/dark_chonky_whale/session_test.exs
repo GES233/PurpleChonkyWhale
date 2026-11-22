@@ -314,6 +314,98 @@ defmodule DarkChonkyWhale.SessionTest do
 
       assert_raise ArgumentError, ~r/unsettled tool calls/, fn -> Session.messages(pid) end
     end
+
+    test "seal_unsettled/2 closes dangling tool calls so an interrupted session can project", %{
+      dir: dir,
+      scope: scope
+    } do
+      pid = open_session(dir, scope, :interrupted)
+      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "read both"})
+      {:ok, _} = append_assistant(pid, [{"c1", "read"}, {"c2", "read"}])
+
+      {:ok, _} =
+        Session.append(pid, :"tool/result", %{
+          "message" => ToolResult.from_result("c1", "read", {:ok, "first file"})
+        })
+
+      # Simulate a crash and reopen with c2 still unsettled on disk.
+      GenServer.stop(pid)
+      pid = open_session(dir, scope, :interrupted)
+
+      assert_raise ArgumentError, ~r/unsettled tool calls: c2/, fn -> Session.messages(pid) end
+
+      assert {:ok, [sealed]} = Session.seal_unsettled(pid, "turn aborted")
+      assert sealed.type == :"tool/result"
+      assert sealed.data["message"]["toolCallId"] == "c2"
+      assert sealed.data["message"]["isError"] == true
+      assert sealed.data["message"]["details"]["error"]["type"] == "interrupted"
+
+      assert [_user, _assistant, r1, r2] = Session.messages(pid)
+      assert r1.tool_call_id == "c1"
+      assert r1.metadata.is_error == false
+      assert r2.tool_call_id == "c2"
+      assert r2.metadata.is_error == true
+      assert [%{type: :text, text: "turn aborted"}] = r2.content
+    end
+
+    test "assistant thinking and signed reasoning_details round-trip through disk and projection",
+         %{
+           dir: dir,
+           scope: scope
+         } do
+      pid = open_session(dir, scope, :thinking)
+
+      {:ok, _} =
+        Session.append(pid, :"assistant/message", %{
+          "content" => "I will check the file.",
+          "thinking" => "Need to inspect config first.",
+          "reasoning_details" => [
+            %{
+              "text" => "Need to inspect config first.",
+              "signature" => "sig_anthropic_123",
+              "encrypted" => true,
+              "provider" => "anthropic",
+              "index" => 0
+            }
+          ],
+          "tool_calls" => [
+            %{
+              "id" => "call_1",
+              "name" => "read",
+              "input" => %{"file_path" => "mix.exs"},
+              "metadata" => %{"thought_signature" => "sig_gemini_456"}
+            }
+          ]
+        })
+
+      {:ok, _} =
+        Session.append(pid, :"tool/result", %{
+          "message" => ToolResult.from_result("call_1", "read", {:ok, "defmodule..."})
+        })
+
+      GenServer.stop(pid)
+      pid = open_session(dir, scope, :thinking)
+
+      assert [assistant, _tool] = Session.messages(pid)
+
+      assert [
+               %{type: :text, text: "I will check the file."},
+               %{type: :thinking, text: "Need to inspect config first."}
+             ] = assistant.content
+
+      assert [
+               %ReqLLM.Message.ReasoningDetails{
+                 text: "Need to inspect config first.",
+                 signature: "sig_anthropic_123",
+                 encrypted?: true,
+                 provider: :anthropic,
+                 index: 0
+               }
+             ] = assistant.reasoning_details
+
+      assert [tool_call] = assistant.tool_calls
+      assert ReqLLM.ToolCall.metadata(tool_call) == %{thought_signature: "sig_gemini_456"}
+    end
   end
 
   describe "the :sessions service" do

@@ -39,6 +39,36 @@ defmodule DarkChonkyWhale.AgentLoopTest do
       stream(chunks ++ [ReqLLM.StreamChunk.meta(%{finish_reason: "tool_use"})])
     end
 
+    defp to_stream_response({:thinking_tool_calls, thinking, signature, calls}) do
+      thinking_chunk =
+        ReqLLM.StreamChunk.thinking(thinking, %{signature: signature, provider: :anthropic})
+
+      call_chunks =
+        Enum.map(calls, fn call ->
+          ReqLLM.StreamChunk.tool_call(call.name, call.arguments, %{"id" => call.id})
+        end)
+
+      stream(
+        [thinking_chunk | call_chunks] ++ [ReqLLM.StreamChunk.meta(%{finish_reason: "tool_use"})]
+      )
+    end
+
+    defp to_stream_response({:stream_timeout, reason}) do
+      raising_stream =
+        Stream.resource(
+          fn -> :ok end,
+          fn :ok ->
+            raise %ReqLLM.Error.API.Stream{
+              reason: "Stream failed: #{inspect(reason)}",
+              cause: reason
+            }
+          end,
+          fn _ -> :ok end
+        )
+
+      stream(raising_stream)
+    end
+
     defp stream(chunks) do
       %ReqLLM.StreamResponse{
         stream: chunks,
@@ -258,6 +288,73 @@ defmodule DarkChonkyWhale.AgentLoopTest do
     # The step's own Session.append fails with :noproc; the turn-closing
     # append in the `after` clause must not mask that with a second crash.
     assert catch_exit(AgentLoop.run(client, session, tools))
+  end
+
+  test "persists thinking and signature across tool call steps and seals prior interrupted calls",
+       %{
+         ctx: ctx,
+         script: script,
+         dir: dir
+       } do
+    tools = await(ctx, :tools)
+    session = open_session(%{dir: dir, scope: ctx.scope}, :s6)
+
+    # Seed an unsettled tool call from a previous interrupted turn.
+    {:ok, _} =
+      Session.append(session, :"assistant/message", %{
+        "content" => "",
+        "tool_calls" => [%{"id" => "dangling_1", "name" => "read", "input" => %{}}]
+      })
+
+    script(script, [
+      {:thinking_tool_calls, "Let me write hello.txt first.", "sig_claude_999",
+       [%{id: "c1", name: "write", arguments: %{"file_path" => "hello.txt", "content" => "hi"}}]},
+      {:text, "all done"}
+    ])
+
+    assert {:ok, "all done"} = AgentLoop.run(client_from(ctx, script), session, tools)
+
+    messages = Session.messages(session)
+
+    # The dangling call from before the turn was sealed with an error result,
+    # and the new assistant step preserved its thinking + signature.
+    assert Enum.any?(messages, fn msg ->
+             msg.role == :tool and msg.tool_call_id == "dangling_1" and
+               msg.metadata.is_error == true
+           end)
+
+    thinking_assistant =
+      Enum.find(messages, fn msg ->
+        msg.role == :assistant and is_list(msg.reasoning_details) and msg.reasoning_details != []
+      end)
+
+    assert thinking_assistant != nil
+
+    assert [
+             %ReqLLM.Message.ReasoningDetails{
+               text: "Let me write hello.txt first.",
+               signature: "sig_claude_999",
+               encrypted?: true,
+               provider: :anthropic
+             }
+           ] = thinking_assistant.reasoning_details
+  end
+
+  test "a mid-stream transport timeout returns {:error, _} and closes the turn without crashing",
+       %{
+         ctx: ctx,
+         script: script,
+         dir: dir
+       } do
+    tools = await(ctx, :tools)
+    session = open_session(%{dir: dir, scope: ctx.scope}, :s7)
+    script(script, [{:stream_timeout, :timeout}])
+
+    assert {:error, %ReqLLM.Error.API.Stream{cause: :timeout}} =
+             AgentLoop.run(client_from(ctx, script), session, tools)
+
+    types = session |> Session.events() |> Enum.map(& &1.type)
+    assert List.last(types) == :"turn/end"
   end
 
   defp client_from(ctx, script) do

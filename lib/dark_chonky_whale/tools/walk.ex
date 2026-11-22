@@ -2,6 +2,8 @@ defmodule DarkChonkyWhale.Tools.Walk do
   # Defined ahead of the moduledoc, which reads it.
   @default_ignore [
     ".git",
+    ".svn",
+    ".hg",
     ".elixir_ls",
     "_build",
     "cover",
@@ -9,8 +11,27 @@ defmodule DarkChonkyWhale.Tools.Walk do
     "doc",
     "node_modules",
     "tmp",
-    ".venv"
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".bloop",
+    ".metals",
+    ".bsp",
+    ".gradle",
+    ".idea",
+    "target",
+    "build",
+    "dist",
+    "out",
+    ".next",
+    ".nuxt",
+    ".cache"
   ]
+
+  @ignore_files [".gitignore", ".ignore"]
 
   @moduledoc """
   The file-tree plumbing the search tools (`glob`, `grep`) share: a
@@ -21,10 +42,12 @@ defmodule DarkChonkyWhale.Tools.Walk do
 
       #{inspect(@default_ignore)}
 
-  `env[:search_ignore_dirs]` replaces that list for a call; an empty list
-  walks everything reachable. Symlinked directories are never followed
-  (`File.lstat/1` sees the link, not the target), so a self-referential link
-  cannot send a walk into a loop.
+  In addition, when pruning is enabled, `.gitignore` and `.ignore` rules in
+  the searched root (and workspace `:cwd`) are honored. `env[:search_ignore_dirs]`
+  replaces the default directory list for a call; an empty list (`[]`)
+  disables all pruning (including ignore files) and walks everything reachable.
+  Symlinked directories are never followed (`File.lstat/1` sees the link, not
+  the target), so a self-referential link cannot send a walk into a loop.
 
   Paths reported by the search tools go through `relative/2`, which makes
   them relative to the working directory and uses `/` separators on every
@@ -44,8 +67,13 @@ defmodule DarkChonkyWhale.Tools.Walk do
   """
   @spec files(Path.t(), DarkChonkyWhale.Tool.env()) :: [Path.t()]
   def files(base, env) do
-    ignore = MapSet.new(ignore_dirs(env))
-    base |> walk(ignore, []) |> Enum.sort()
+    dirs = ignore_dirs(env)
+    ignore = MapSet.new(dirs)
+    rules = if dirs == [], do: [], else: load_ignore_rules(base, env)
+
+    base
+    |> walk(base, ignore, rules, [])
+    |> Enum.sort()
   end
 
   @doc """
@@ -82,15 +110,25 @@ defmodule DarkChonkyWhale.Tools.Walk do
 
   ## Internal
 
-  defp walk(dir, ignore, acc) do
+  defp walk(dir, root, ignore, rules, acc) do
+    local_rules =
+      if dir == root or (rules == [] and MapSet.size(ignore) == 0) do
+        rules
+      else
+        rules ++ read_dir_ignore_rules(dir, root)
+      end
+
     case File.ls(dir) do
       {:ok, entries} ->
         Enum.reduce(entries, acc, fn entry, acc ->
           path = Path.join(dir, entry)
+          rel = relative(path, root)
+          is_dir = directory?(path)
 
           cond do
             MapSet.member?(ignore, entry) -> acc
-            directory?(path) -> walk(path, ignore, acc)
+            ignored_by_rules?(rel, entry, is_dir, local_rules) -> acc
+            is_dir -> walk(path, root, ignore, local_rules, acc)
             File.regular?(path) -> [path | acc]
             true -> acc
           end
@@ -100,6 +138,105 @@ defmodule DarkChonkyWhale.Tools.Walk do
       {:error, _reason} ->
         acc
     end
+  end
+
+  defp load_ignore_rules(base, env) do
+    cwd = env[:cwd]
+
+    roots =
+      if is_binary(cwd) and Path.expand(cwd) != Path.expand(base) do
+        [cwd, base]
+      else
+        [base]
+      end
+
+    Enum.flat_map(roots, &read_dir_ignore_rules(&1, base))
+  end
+
+  defp read_dir_ignore_rules(dir, root) do
+    prefix =
+      case Path.relative_to(dir, root) do
+        "." -> ""
+        rel -> slash(rel) <> "/"
+      end
+
+    Enum.flat_map(@ignore_files, fn filename ->
+      path = Path.join(dir, filename)
+
+      case File.read(path) do
+        {:ok, content} -> parse_ignore_content(content, prefix)
+        {:error, _} -> []
+      end
+    end)
+  end
+
+  defp parse_ignore_content(content, prefix) do
+    content
+    |> String.split(~r/\r?\n/)
+    |> Enum.flat_map(&compile_ignore_line(&1, prefix))
+  end
+
+  defp compile_ignore_line(line, prefix) do
+    trimmed = String.trim(line)
+
+    if trimmed == "" or String.starts_with?(trimmed, "#") do
+      []
+    else
+      {negated?, raw} =
+        if String.starts_with?(trimmed, "!") do
+          {true, String.slice(trimmed, 1..-1//1)}
+        else
+          {false, trimmed}
+        end
+
+      dir_only? = String.ends_with?(raw, "/")
+      cleaned = raw |> String.trim_leading("/") |> String.trim_trailing("/")
+      anchored? = String.starts_with?(raw, "/") or String.contains?(cleaned, "/")
+
+      if cleaned == "" do
+        []
+      else
+        regex =
+          if anchored? do
+            compile_glob(prefix <> cleaned)
+          else
+            compile_glob(cleaned)
+          end
+
+        [
+          %{
+            negated?: negated?,
+            dir_only?: dir_only?,
+            anchored?: anchored?,
+            regex: regex
+          }
+        ]
+      end
+    end
+  rescue
+    _ -> []
+  end
+
+  defp ignored_by_rules?(_rel, _entry, _is_dir, []), do: false
+
+  defp ignored_by_rules?(rel, entry, is_dir, rules) do
+    Enum.reduce(rules, false, fn rule, ignored? ->
+      if rule_matches?(rule, rel, entry, is_dir) do
+        not rule.negated?
+      else
+        ignored?
+      end
+    end)
+  end
+
+  defp rule_matches?(%{dir_only?: true}, _rel, _entry, false), do: false
+
+  defp rule_matches?(%{anchored?: true, regex: regex}, rel, _entry, _is_dir) do
+    Regex.match?(regex, rel)
+  end
+
+  defp rule_matches?(%{anchored?: false, regex: regex}, rel, entry, _is_dir) do
+    Regex.match?(regex, entry) or Regex.match?(regex, rel)
   end
 
   defp directory?(path) do

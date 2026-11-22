@@ -9,14 +9,9 @@ this tree; nothing is aspirational.
 
 ```sh
 mix compile            # deps are vendored in deps/ (git sparse checkout of GES233/Dexterous)
-mix test               # 92 tests / 1 doctest, ~4s; many runtimes are skipped when absent
+mix test               # 100 tests / 1 doctest, ~4.5s; many runtimes are skipped when absent
 mix format             # .formatter.exs covers mix.exs, config/, lib/, test/ — NOT examples/
 ```
-
-Note: `mix format --check-formatted` currently fails on
-`lib/dark_chonky_whale/executor/runner.ex` and the runtime modules
-`python.ex`, `elixir_subprocess.ex`, and `powershell.ex` (pre-existing
-formatting drift, not a bug). Running `mix format` fixes those four files.
 
 Run things without config: `mix run examples/session_demo.exs` needs no network.
 `examples/smoke_llm.exs`, `examples/agent.exs`, `examples/multi_turn_agent.exs`
@@ -93,7 +88,8 @@ temp file).
 - **Tool batches are provider-safe.** Each declared call has at most one result
   per batch; results project in assistant call order, deferred user/assistant
   input follows the complete batch, and projecting an unsettled batch raises
-  instead of emitting an invalid provider request.
+  instead of emitting an invalid provider request (`Session.seal_unsettled/2`
+  seals interrupted batches with synthetic error results).
 - **Plans are plain data; runtimes never touch the filesystem.** A plan is
   `%{exe, args, cwd, script}` where `script` is *content* and the `:script`
   atom marks where its path belongs; `Runner.run/2` writes it to a fresh temp
@@ -132,6 +128,7 @@ temp file).
   one means changing that list and recompiling `codepagex`.
 - `.formatter.exs` inputs exclude `examples/`; formatting them is not covered
   by `mix format`.
-- `Tools.Walk` prunes by directory *name* (`.git`, `_build`, `deps`, …) and
-  never follows symlinked dirs; override per call with `env[:search_ignore_dirs]`
-  (`[]` walks everything reachable).
+- `Tools.Walk` prunes by directory *name* (`.git`, `_build`, `deps`, `.bloop`,
+  `build`, `target`, …) plus `.gitignore`/`.ignore` rules and never follows
+  symlinked dirs; override per call with `env[:search_ignore_dirs]` (`[]`
+  disables all pruning and walks everything reachable).

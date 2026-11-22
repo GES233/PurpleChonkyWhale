@@ -21,6 +21,7 @@
 # streams the answer, `tools/post-execute` reports each tool call.
 
 alias DarkChonkyWhale.{AgentLoop, LLM, Session, Sessions, Tools}
+alias DarkChonkyWhale.Executor.Runtimes.Shell
 alias Dexterous.Context
 alias DexterousLoader.Entry
 
@@ -145,13 +146,31 @@ validation_instruction =
     "Use the target project's own commands to validate changes."
   end
 
+shell_description = Shell.describe(tool_env)
+
+workspace_instructions =
+  ["AGENTS.md", "CLAUDE.md"]
+  |> Enum.find_value(fn name ->
+    path = Path.join(cwd, name)
+
+    case File.read(path) do
+      {:ok, content} when byte_size(content) > 0 ->
+        "\n\nWorkspace instructions from #{name}:\n\n" <> String.slice(content, 0, 16_000)
+
+      _ ->
+        nil
+    end
+  end) || ""
+
 system = """
 You are a coding agent working in #{cwd}. Use the read/write/edit/glob/grep
 tools to inspect and modify files, and execute to run the tests, git or a
-build. #{validation_instruction}
+build.
+The default `execute` (`runtime: "shell"`) runs in: #{shell_description}.
+#{validation_instruction}
 This is a multi-turn conversation: earlier turns are in your context, so build
 on what you already learned instead of re-investigating from scratch.
-When a turn's task is done, answer briefly without calling tools.
+When a turn's task is done, answer briefly without calling tools.#{workspace_instructions}
 """
 
 # Open a fresh session log and seed it with the system message. Each turn

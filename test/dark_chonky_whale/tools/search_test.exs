@@ -47,6 +47,19 @@ defmodule DarkChonkyWhale.Tools.SearchTest do
       assert length(files) == 6
     end
 
+    test "honors .gitignore and .ignore rules when pruning is enabled", %{dir: dir, env: env} do
+      File.write!(Path.join(dir, ".gitignore"), ".aoci/\n*.log\n!keep.log\n")
+      File.mkdir_p!(Path.join(dir, ".aoci"))
+      File.write!(Path.join(dir, ".aoci/fragment.json"), "{}")
+      File.write!(Path.join(dir, "debug.log"), "noise")
+      File.write!(Path.join(dir, "keep.log"), "important")
+
+      rels = dir |> Walk.files(env) |> Enum.map(&Walk.relative(&1, dir))
+      refute ".aoci/fragment.json" in rels
+      refute "debug.log" in rels
+      assert "keep.log" in rels
+    end
+
     test "does not follow symlinked directory loops", %{dir: dir, env: env} do
       # Symlink creation needs privileges on Windows; without it the
       # walk-loop guarantee is simply untested here.
@@ -82,6 +95,16 @@ defmodule DarkChonkyWhale.Tools.SearchTest do
     test "a path without / matches the file name at any depth", %{env: env} do
       assert {:ok, "lib/nested/b.ex"} = Glob.execute(%{"pattern" => "b.ex"}, env)
       assert {:ok, "lib/notes.txt"} = Glob.execute(%{"pattern" => "notes.txt"}, env)
+    end
+
+    test "orders shallowest paths first and honors max_depth", %{dir: dir, env: env} do
+      File.write!(Path.join(dir, "README.md"), "root")
+
+      assert {:ok, "README.md"} =
+               Glob.execute(%{"pattern" => "*", "max_depth" => 1}, env)
+
+      assert {:ok, all} = Glob.execute(%{"pattern" => "*"}, env)
+      assert hd(String.split(all, "\n")) == "README.md"
     end
 
     test "honors an explicit path and a limit; paths are cwd-relative", %{env: env} do
