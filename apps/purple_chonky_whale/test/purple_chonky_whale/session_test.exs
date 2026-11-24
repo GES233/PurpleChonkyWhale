@@ -237,6 +237,30 @@ defmodule PurpleChonkyWhale.SessionTest do
       assert [%{type: :text, text: "4"}] = assistant.content
     end
 
+    test "userId marks the speaker in multi-actor logs; single-user logs project unchanged", %{
+      dir: dir,
+      scope: scope
+    } do
+      pid = open_session(dir, scope, :multi)
+
+      {:ok, alice_event} =
+        Session.append(pid, :"user/message", %{"userId" => "alice", "content" => "hi"})
+
+      {:ok, _} = Session.append(pid, :"user/message", %{"userId" => "bob", "content" => "yo"})
+      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "plain"})
+
+      assert [alice, bob, plain] = Session.messages(pid)
+      assert [%{type: :text, text: "alice: hi"}] = alice.content
+      assert [%{type: :text, text: "bob: yo"}] = bob.content
+      assert [%{type: :text, text: "plain"}] = plain.content
+
+      # The actor is durable: it persists in the event payload.
+      assert alice_event.data["userId"] == "alice"
+      GenServer.stop(pid)
+      pid = open_session(dir, scope, :multi)
+      assert [%{data: %{"userId" => "alice"}} | _] = Session.events(pid)
+    end
+
     test "canonical results preserve JSON success and structured errors", %{
       dir: dir,
       scope: scope

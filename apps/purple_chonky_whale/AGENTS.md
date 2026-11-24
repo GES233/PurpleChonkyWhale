@@ -69,7 +69,12 @@ temp file).
   (`GenServer`). V1 files have a physical header followed by events with
   `seq`/`id`/`parent_id`/`at`; headerless v0 files retain their disk shape.
   The log persists before advancing memory, replays on open, and broadcasts
-  every append.
+  every append. A `user/message` may carry `"userId"` to mark the speaker in
+  multi-actor logs (the projection prefixes it); single-user logs omit it.
+- `Presets` — persona compositions for `:coding`/`:personal`/`:tutor` as
+  ready-made entry lists (`entries/2`) plus per-persona system prompts
+  (`system_prompt/2`): per-persona sessions dirs, per-persona tool sets, and
+  a workspace → persona → global skill directory chain.
 - `ToolResult` — converts callback results to the canonical `toolResult`
   message (`content`, `details`, `isError`) and projects them to ReqLLM.
 - `Tools` — registry + guarded pipeline (`lookup/2`, `schemas/1`,

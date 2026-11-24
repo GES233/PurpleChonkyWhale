@@ -14,7 +14,9 @@ defmodule PurpleChonkyWhale.Session do
   the `messages/1` projection folds into `ReqLLM.Message`s:
 
     * `:"system/message"` — `%{content}`
-    * `:"user/message"` — `%{content}`
+    * `:"user/message"` — `%{content}`; an optional `"userId"` marks the
+      speaker in multi-actor logs (the projection prefixes it so the model
+      can tell speakers apart)
     * `:"assistant/message"` — `%{content, thinking, reasoning_details, tool_calls: [%{id, name, input, metadata}]}`
       (`thinking`, `reasoning_details`, and `tool_calls` optional)
     * `:"tool/result"` — canonical `%{"message" => toolResult}` or the legacy
@@ -348,7 +350,7 @@ defmodule PurpleChonkyWhale.Session do
   end
 
   defp project_message(%{type: :"user/message", data: data}) do
-    {ReqLLM.Context.user(data["content"]), []}
+    {ReqLLM.Context.user(prefix_actor(data["content"], data["userId"])), []}
   end
 
   defp project_message(%{type: :"assistant/message", data: data}) do
@@ -366,6 +368,15 @@ defmodule PurpleChonkyWhale.Session do
     ids = Enum.map(data["tool_calls"] || [], & &1["id"])
     {message, ids}
   end
+
+  # Multi-actor logs (e.g. a work session with several members) carry a
+  # "userId" per message; prefix it so the model can tell speakers apart.
+  # Single-user logs omit the key and project unchanged.
+  defp prefix_actor(content, user_id) when is_binary(user_id) and user_id != "" do
+    "#{user_id}: #{content}"
+  end
+
+  defp prefix_actor(content, _user_id), do: content
 
   defp project_tool_call(call) do
     input = call["input"] || %{}
