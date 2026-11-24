@@ -26,6 +26,7 @@ defmodule Noctilucent.MixProject do
     [
       {:purple_chonky_whale, in_umbrella: true},
       {:dexterous_loader, github: "GES233/Dexterous", sparse: "apps/dexterous_loader"},
+      {:dexterous_hmr, github: "GES233/Dexterous", sparse: "apps/dexterous_hmr"},
       {:llm_db, ">= 2026.11.6"}
     ]
   end
