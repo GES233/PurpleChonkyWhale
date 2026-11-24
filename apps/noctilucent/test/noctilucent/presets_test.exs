@@ -4,20 +4,51 @@ defmodule Noctilucent.PresetsTest do
   @moduletag :tmp_dir
 
   alias Noctilucent.Presets
-  alias PurpleChonkyWhale.{LLM, Sessions, Tools}
+  alias PurpleChonkyWhale.{LLM, Memory, Sessions, Tools}
   alias DexterousLoader.Entry
 
   defp entry(entries, id), do: Enum.find(entries, &(&1.id == id))
 
-  test "every persona mounts the three seams", %{tmp_dir: tmp_dir} do
+  test "every persona mounts the four seams", %{tmp_dir: tmp_dir} do
     for persona <- Presets.personas() do
       entries = Presets.entries(persona, home: tmp_dir, cwd: tmp_dir)
 
       assert [
                %Entry{id: :llm, component: LLM},
                %Entry{id: :sessions, component: Sessions},
-               %Entry{id: :tools, component: Tools}
+               %Entry{id: :tools, component: Tools},
+               %Entry{id: :memory, component: Memory}
              ] = entries
+    end
+  end
+
+  test "memory layers are persona-writable then global-read-only", %{tmp_dir: tmp_dir} do
+    layers =
+      Presets.entries(:personal, home: tmp_dir)
+      |> entry(:memory)
+      |> Map.fetch!(:config)
+      |> Keyword.fetch!(:layers)
+
+    assert [{:persona, persona_dir, [writable: true]} | global] = layers
+    assert persona_dir == Path.join([tmp_dir, "personal", "memory"])
+
+    case global do
+      [{:global, _dir, [writable: false]}] -> :ok
+      [] -> :ok
+    end
+  end
+
+  test "every persona can save, update and delete memories", %{tmp_dir: tmp_dir} do
+    for persona <- Presets.personas() do
+      tools =
+        Presets.entries(persona, home: tmp_dir)
+        |> entry(:tools)
+        |> Map.fetch!(:config)
+        |> Keyword.fetch!(:tools)
+
+      assert Tools.Memory in tools
+      assert Tools.MemoryUpdate in tools
+      assert Tools.MemoryDelete in tools
     end
   end
 

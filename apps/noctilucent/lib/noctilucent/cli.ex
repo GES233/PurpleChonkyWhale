@@ -32,7 +32,7 @@ defmodule Noctilucent.CLI do
   """
 
   alias Noctilucent.Presets
-  alias PurpleChonkyWhale.{AgentRun, Session, Sessions, Tools}
+  alias PurpleChonkyWhale.{AgentRun, Memory, Session, Sessions, Tools}
   alias Dexterous.Context
 
   @switches [
@@ -169,11 +169,12 @@ defmodule Noctilucent.CLI do
     llm = await(ctx, :llm)
     sessions = await(ctx, :sessions)
     tools = await(ctx, :tools)
+    memory = await(ctx, :memory)
 
     system = Presets.system_prompt(config.persona, cwd: cwd) <> skill_section(tools)
 
     {session_id, session} =
-      open_session(sessions, config.session || fresh_id(config.persona), system)
+      open_session(sessions, config.session || fresh_id(config.persona), system, memory)
 
     IO.puts([
       "persona: #{config.persona}\n",
@@ -194,7 +195,8 @@ defmodule Noctilucent.CLI do
       tools: tools,
       persona: config.persona,
       cwd: cwd,
-      vision?: tools.env[:vision?] != false
+      vision?: tools.env[:vision?] != false,
+      memory: memory
     })
   end
 
@@ -276,12 +278,27 @@ defmodule Noctilucent.CLI do
     Tools.Skill.prompt_section(tools.env)
   end
 
-  defp open_session(sessions, id, system) do
+  # A fresh session is seeded with the persona's system prompt plus the
+  # recalled memory as a second system message — recalled memory is
+  # model-visible, therefore it must be logged. Resumed sessions keep their
+  # log untouched (their recall happened when they were created).
+  defp open_session(sessions, id, system, memory) do
     {:ok, session} = Sessions.open(sessions, id)
     {:ok, _} = Session.seal_unsettled(session)
 
     if Session.events(session) == [] do
       {:ok, _} = Session.append(session, :"system/message", %{"content" => system})
+
+      case Memory.recall(memory) do
+        "" ->
+          :ok
+
+        recalled ->
+          {:ok, _} =
+            Session.append(session, :"system/message", %{
+              "content" => "Recalled long-term memory:\n\n" <> recalled
+            })
+      end
     end
 
     {id, session}
@@ -309,6 +326,21 @@ defmodule Noctilucent.CLI do
           end
 
         IO.puts("\n[tool #{name}] #{status} (#{ms}ms)")
+      end)
+
+    {:ok, _} =
+      Context.on(ctx, :"memory/remember", fn %{layer: layer} ->
+        IO.puts("\n[memory → #{layer}]")
+      end)
+
+    {:ok, _} =
+      Context.on(ctx, :"memory/update", fn %{layer: layer, updated: count} ->
+        IO.puts("\n[memory → #{layer}: #{count} updated]")
+      end)
+
+    {:ok, _} =
+      Context.on(ctx, :"memory/delete", fn %{layer: layer, deleted: count} ->
+        IO.puts("\n[memory → #{layer}: #{count} deleted]")
       end)
 
     {:ok, _} =
@@ -369,7 +401,9 @@ defmodule Noctilucent.CLI do
         loop(state, rest, eof?)
 
       {:line, "/reset", rest, eof?} ->
-        {id, session} = open_session(state.sessions, fresh_id(state.persona), state.system)
+        {id, session} =
+          open_session(state.sessions, fresh_id(state.persona), state.system, state.memory)
+
         IO.puts("[reset — switched to fresh session #{id}]")
         loop(%{state | session_id: id, session: session}, rest, eof?)
 
@@ -385,7 +419,7 @@ defmodule Noctilucent.CLI do
             loop(state, rest, eof?)
 
           target ->
-            {id, session} = open_session(state.sessions, target, state.system)
+            {id, session} = open_session(state.sessions, target, state.system, state.memory)
             count = length(Session.messages(session))
             IO.puts("[resumed session #{id} (#{count} model-visible messages)]")
             loop(%{state | session_id: id, session: session}, rest, eof?)

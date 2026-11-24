@@ -9,7 +9,7 @@ this tree; nothing is aspirational.
 
 ```sh
 mix compile            # deps are vendored under deps/; Dexterous apps come from a sparse checkout
-mix test               # 117 tests / 1 doctest, ~5s; runtimes are skipped when absent
+mix test               # 130 tests / 1 doctest, ~5s; runtimes are skipped when absent
 mix format             # .formatter.exs covers mix.exs, config/, lib/, test/ — NOT examples/
 ```
 
@@ -30,6 +30,7 @@ is given per entry, e.g. in `examples/agent.exs`.
 | `:llm` | `PurpleChonkyWhale.LLM` (config `:model` required; other keys pass through to ReqLLM) | `%LLM.Client{}` | `llm/request` (waterfall), `llm/chunk`, `llm/usage` (emits) |
 | `:sessions` | `PurpleChonkyWhale.Sessions` (config `:dir` required) | `%Sessions{}` | `session/event` (emit, per append) |
 | `:tools` | `PurpleChonkyWhale.Tools` (config `:tools`, `:env`) | `%Tools{}` registry | `tools/pre-execute` (waterfall over `%{name:, arguments:, decision:}`), `tools/post-execute` (emit) |
+| `:memory` | `PurpleChonkyWhale.Memory` (config `:layers`) | `%Memory{}` | `memory/recall`, `memory/remember` (emits) |
 
 `PurpleChonkyWhale.AgentLoop.run/4` is the driver: it seals any tool calls left
 unsettled by an interrupted turn, logs `turn/start`, then loops over
@@ -84,6 +85,16 @@ temp file).
   persona compositions are application policy, not kernel. The kernel keeps
   only the conventions the presets rely on: the `:tools` env keys `:cwd`,
   `:skill_dirs` and `:vision?` (whether the model accepts image input).
+- `Memory` — the `:memory` seam: layered file-backed memory, one `MEMORY.md`
+  per layer directory, ordered most-specific-first. `recall/1` concatenates
+  layers (per-layer byte cap, truncation noted) for the caller to log as a
+  `system/message`; `remember/2` appends one dated line to the innermost
+  writable layer (layers default to read-only); `update_many/2` rewrites
+  matching lines atomically (all matches validated before writing),
+  `delete/2` removes matching lines. `Tools.Memory` (`memory_save`),
+  `Tools.MemoryUpdate` (`memory_update` — a batch list, so one call covers
+  update-many) and `Tools.MemoryDelete` (`memory_delete`) reach the handle
+  through the scope carried in the tools env.
 - `ToolResult` — converts callback results to the canonical `toolResult`
   message (`content`, `details`, `isError`) and projects them to ReqLLM.
   `{:ok, {:parts, parts}}` outputs (built with `text_part/1` / `image_part/2`)

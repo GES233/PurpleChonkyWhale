@@ -5,14 +5,16 @@ defmodule Noctilucent.Presets do
 
   A persona is not a code fork — it is a choice of model, session directory,
   tool set and skill directory chain, expressed as `DexterousLoader.Entry`
-  records. `entries/2` returns the three seam entries (`:llm`, `:sessions`,
-  `:tools`) ready for `DexterousLoader.start_link/2`; `system_prompt/2` gives
-  the persona's opening `:"system/message"` content, which the caller appends
-  to a fresh session (model-visible means logged).
+  records. `entries/2` returns the four seam entries (`:llm`, `:sessions`,
+  `:tools`, `:memory`) ready for `DexterousLoader.start_link/2`;
+  `system_prompt/2` gives the persona's opening `:"system/message"` content,
+  which the caller appends to a fresh session (model-visible means logged).
 
   Isolation between personas falls out of the composition: each preset points
-  `:sessions` at its own directory and declares its own tool list, and each
-  loader gets its own scope (and with it, its own event bus).
+  `:sessions` at its own directory, declares its own tool list, and layers
+  `:memory` as persona (writable, `<home>/<persona>/memory`) → global
+  (read-only, `~/.agents/memory`); each loader gets its own scope (and with
+  it, its own event bus).
 
   Options for `entries/2` and `system_prompt/2`:
 
@@ -30,7 +32,7 @@ defmodule Noctilucent.Presets do
   → persona (`<home>/<persona>/skills`) → global (`~/.agents/skills`).
   """
 
-  alias PurpleChonkyWhale.{LLM, Sessions, Tools}
+  alias PurpleChonkyWhale.{LLM, Memory, Sessions, Tools}
   alias DexterousLoader.Entry
 
   @type persona :: :coding | :personal | :tutor
@@ -68,6 +70,11 @@ defmodule Noctilucent.Presets do
           tools: tools_for(persona),
           env: %{cwd: cwd, skill_dirs: skill_dirs(home, persona, cwd), vision?: vision?(model)}
         ]
+      },
+      %Entry{
+        id: :memory,
+        component: Memory,
+        config: [layers: memory_layers(home, persona)]
       }
     ]
   end
@@ -87,6 +94,8 @@ defmodule Noctilucent.Presets do
         Use the read/write/edit/glob/grep tools to inspect and modify files, and
         execute to run tests, git or a build.
         After editing source files under lib/, call recompile to hot-swap them.
+        Use memory_save for decisions or facts that should outlive this session,
+        and memory_update/memory_delete to correct or retire stored lines.
         When the task is done, answer briefly without calling tools.
         """
 
@@ -94,14 +103,18 @@ defmodule Noctilucent.Presets do
         """
         You are a personal agent. The working directory is #{cwd}.
         Use the file tools to read and organize notes, and todo_write to track
-        tasks. Be concise; ask before any destructive change.
+        tasks. Use memory_save for facts and preferences that should outlive
+        this session, and memory_update/memory_delete to correct or retire
+        stale ones. Be concise; ask before any destructive change.
         """
 
       :tutor ->
         """
         You are a tutor. You can inspect files with read/glob/grep but cannot
         modify anything. Teach through questions rather than giving answers
-        away, and adapt to the learner's level.
+        away, adapt to the learner's level, and use memory_save (plus
+        memory_update/memory_delete) to keep track of their progress between
+        sessions.
         """
     end
   end
@@ -118,7 +131,10 @@ defmodule Noctilucent.Presets do
       Tools.Executor,
       Tools.TodoWrite,
       Tools.Skill,
-      Tools.Recompile
+      Tools.Recompile,
+      Tools.Memory,
+      Tools.MemoryUpdate,
+      Tools.MemoryDelete
     ]
   end
 
@@ -130,7 +146,10 @@ defmodule Noctilucent.Presets do
       Tools.Glob,
       Tools.Grep,
       Tools.TodoWrite,
-      Tools.Skill
+      Tools.Skill,
+      Tools.Memory,
+      Tools.MemoryUpdate,
+      Tools.MemoryDelete
     ]
   end
 
@@ -139,7 +158,10 @@ defmodule Noctilucent.Presets do
       Tools.Read,
       Tools.Glob,
       Tools.Grep,
-      Tools.Skill
+      Tools.Skill,
+      Tools.Memory,
+      Tools.MemoryUpdate,
+      Tools.MemoryDelete
     ]
   end
 
@@ -168,6 +190,19 @@ defmodule Noctilucent.Presets do
   end
 
   defp vision?(_model), do: true
+
+  defp memory_layers(home, persona) do
+    persona_layer =
+      {:persona, Path.join([home, Atom.to_string(persona), "memory"]), writable: true}
+
+    global =
+      case System.user_home() do
+        nil -> []
+        user_home -> [{:global, Path.join([user_home, ".agents", "memory"]), writable: false}]
+      end
+
+    [persona_layer | global]
+  end
 
   defp skill_dirs(home, persona, cwd) do
     workspace = Enum.map([".agents/skills", ".claude/skills", "skills"], &Path.join(cwd, &1))

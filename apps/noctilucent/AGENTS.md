@@ -9,7 +9,9 @@ stays generic.
 
 - `Noctilucent.Presets` — the persona presets: `coding` / `personal` / `tutor`
   compositions of model, session dir, tool set, skill directory chain and
-  system prompt (`entries/2` + `system_prompt/2`). Derives the `:tools` env's
+  system prompt (`entries/2` + `system_prompt/2`). Mounts the fourth seam
+  `:memory` with persona-writable (`<home>/<persona>/memory`) → global
+  read-only (`~/.agents/memory`) layers, and derives the `:tools` env's
   `vision?` from the model's LLMDB input modalities (unknown models fail
   open). Persona isolation falls out of the composition: separate session
   dirs, tool sets and scopes.
@@ -17,8 +19,12 @@ stays generic.
   `lib/mix/tasks/noctilucent.ex`). Multi-turn over one session log, slash
   commands `/quit` `/cancel` `/steer` `/reset` `/sessions` `/resume` `/log`,
   inline image attachments via `@path/to/img.png` (truncated trailing
-  punctuation is stripped from tokens). Rendering is driven by seam events
-  (`llm/chunk`, `tools/post-execute`, `tools/todo`), not by the loop.
+  punctuation is stripped from tokens). A fresh session is seeded with the
+  persona's system prompt plus the recalled memory as a second
+  `system/message` (recalled memory is model-visible, therefore logged);
+  resumed sessions keep their log untouched. Rendering is driven by seam
+  events (`llm/chunk`, `tools/post-execute`, `tools/todo`, `memory/remember`),
+  not by the loop.
 - `examples/image_demo.exs` — one-shot image-reading demo against a live
   provider.
 
@@ -31,6 +37,7 @@ stays generic.
 - The coding persona wires `DexterousHMR` for its `recompile` tool; other
   personas don't need it.
 - State lives under `~/.pcw` by default: `sessions/<persona>/` (plus `blobs/`
-  per session dir) and `<persona>/skills/`.
+  per session dir), `<persona>/skills/` and `<persona>/memory/MEMORY.md`;
+  the global read-only memory layer is `~/.agents/memory/MEMORY.md`.
 - `examples/` is excluded from `mix format` (each app's `.formatter.exs`
   covers only `{lib,test}/**`).
