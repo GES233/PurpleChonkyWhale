@@ -74,4 +74,52 @@ defmodule PurpleChonkyWhale.Tools.ReadWriteTest do
       assert result =~ "past the end"
     end
   end
+
+  describe "read (images)" do
+    # PNG magic header plus filler; the tool treats bytes opaquely.
+    @png <<137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3>>
+
+    test "image files come back as an image part plus a text note", %{env: env, dir: dir} do
+      File.write!(Path.join(dir, "pic.png"), @png)
+
+      assert {:ok, {:parts, [image, note]}} = Read.execute(%{"file_path" => "pic.png"}, env)
+      assert %{"type" => "image", "data" => @png, "mediaType" => "image/png"} = image
+      assert %{"type" => "text", "text" => text} = note
+      assert text =~ "image/png"
+      assert text =~ "pic.png"
+    end
+
+    test "extensions match case-insensitively", %{env: env, dir: dir} do
+      File.write!(Path.join(dir, "PIC.JPEG"), @png)
+
+      assert {:ok, {:parts, [%{"mediaType" => "image/jpeg"} | _]}} =
+               Read.execute(%{"file_path" => "PIC.JPEG"}, env)
+    end
+
+    test "vision?: false answers with a text description instead of the image", %{
+      env: env,
+      dir: dir
+    } do
+      File.write!(Path.join(dir, "pic.png"), @png)
+
+      assert {:ok, text} =
+               Read.execute(%{"file_path" => "pic.png"}, Map.put(env, :vision?, false))
+
+      assert text =~ "image/png"
+      assert text =~ "pic.png"
+    end
+
+    test "images over the byte limit are refused with a downscale hint", %{env: env, dir: dir} do
+      File.write!(Path.join(dir, "big.png"), :binary.copy(<<0>>, 6 * 1024 * 1024))
+
+      assert {:error, message} = Read.execute(%{"file_path" => "big.png"}, env)
+      assert message =~ "over the 5 MB limit"
+      assert message =~ "downscale"
+    end
+
+    test "missing image files report like missing text files", %{env: env} do
+      assert {:error, message} = Read.execute(%{"file_path" => "missing.png"}, env)
+      assert message =~ "file not found"
+    end
+  end
 end

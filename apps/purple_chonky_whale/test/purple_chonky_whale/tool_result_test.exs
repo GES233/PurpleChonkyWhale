@@ -55,4 +55,29 @@ defmodule PurpleChonkyWhale.ToolResultTest do
     assert success["isError"] == false
     assert [%{"text" => ~s({"answer":42})}] = success["content"]
   end
+
+  test "multi-part outputs keep text and image parts through the projection" do
+    png = <<137, 80, 78, 71, 13, 10, 26, 10>>
+
+    result =
+      ToolResult.from_result(
+        "c1",
+        "read",
+        {:ok, {:parts, [ToolResult.image_part(png, "image/png"), ToolResult.text_part("a png")]}}
+      )
+
+    assert result["isError"] == false
+
+    assert [
+             %{"type" => "image", "data" => ^png, "mediaType" => "image/png"},
+             %{"type" => "text", "text" => "a png"}
+           ] = result["content"]
+
+    projected = ToolResult.to_reqllm(result)
+
+    assert [
+             %{type: :image, data: ^png, media_type: "image/png"},
+             %{type: :text, text: "a png"}
+           ] = projected.content
+  end
 end

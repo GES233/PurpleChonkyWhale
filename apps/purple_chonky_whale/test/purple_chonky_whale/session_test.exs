@@ -339,6 +339,53 @@ defmodule PurpleChonkyWhale.SessionTest do
       assert_raise ArgumentError, ~r/unsettled tool calls/, fn -> Session.messages(pid) end
     end
 
+    test "image parts are stored as blobs and rehydrated on projection", %{
+      dir: dir,
+      scope: scope
+    } do
+      png = <<137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3>>
+      pid = open_session(dir, scope, :img)
+      {:ok, _} = append_assistant(pid, [{"c1", "read"}])
+
+      {:ok, event} =
+        Session.append(pid, :"tool/result", %{
+          "message" =>
+            ToolResult.from_result(
+              "c1",
+              "read",
+              {:ok, {:parts, [ToolResult.image_part(png, "image/png")]}}
+            )
+        })
+
+      [part] = event.data["message"]["content"]
+      refute Map.has_key?(part, "data")
+      assert part["type"] == "image"
+      assert part["mediaType"] == "image/png"
+      assert part["bytes"] == byte_size(png)
+      assert part["blob"] =~ ".png"
+      assert File.read!(Path.join([dir, "blobs", part["blob"]])) == png
+
+      # The durable log holds the reference, not the payload.
+      refute File.read!(Path.join(dir, "session-img.jsonl")) =~ Base.encode64(png)
+
+      assert [_assistant, tool] = Session.messages(pid)
+      assert [%{type: :image, data: ^png, media_type: "image/png"}] = tool.content
+
+      # Reopening replays from disk and rehydrates the same way.
+      GenServer.stop(pid)
+      pid = open_session(dir, scope, :img)
+      assert [_assistant, tool] = Session.messages(pid)
+      assert [%{type: :image, data: ^png}] = tool.content
+
+      # A missing blob degrades to a text placeholder, never a projection failure.
+      File.rm!(Path.join([dir, "blobs", part["blob"]]))
+      GenServer.stop(pid)
+      pid = open_session(dir, scope, :img)
+      assert [_assistant, tool] = Session.messages(pid)
+      assert [%{type: :text, text: text}] = tool.content
+      assert text =~ "image unavailable"
+    end
+
     test "seal_unsettled/2 distinguishes started (outcome_unknown) vs not_started (cancelled) calls and binds runId",
          %{
            dir: dir,

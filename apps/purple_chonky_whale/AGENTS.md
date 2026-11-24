@@ -9,7 +9,7 @@ this tree; nothing is aspirational.
 
 ```sh
 mix compile            # deps are vendored under deps/; Dexterous apps come from a sparse checkout
-mix test               # 109 tests / 1 doctest, ~5s; runtimes are skipped when absent
+mix test               # 126 tests / 1 doctest, ~5s; runtimes are skipped when absent
 mix format             # .formatter.exs covers mix.exs, config/, lib/, test/ — NOT examples/
 ```
 
@@ -71,17 +71,28 @@ temp file).
   The log persists before advancing memory, replays on open, and broadcasts
   every append. A `user/message` may carry `"userId"` to mark the speaker in
   multi-actor logs (the projection prefixes it); single-user logs omit it.
+  Binary image parts never enter the JSONL: append externalizes them to
+  content-addressed files under `<dir>/blobs/`, the event keeps a
+  `%{"type" => "image", "blob", "mediaType", "bytes"}` reference, and
+  projection rehydrates the bytes (a missing blob degrades to a text
+  placeholder, never a projection failure).
 - `Presets` — persona compositions for `:coding`/`:personal`/`:tutor` as
   ready-made entry lists (`entries/2`) plus per-persona system prompts
   (`system_prompt/2`): per-persona sessions dirs, per-persona tool sets, and
-  a workspace → persona → global skill directory chain.
+  a workspace → persona → global skill directory chain. The `:tools` env
+  carries `vision?`, derived from the model's LLMDB input modalities
+  (`:image` present); unknown models fail open.
 - `ToolResult` — converts callback results to the canonical `toolResult`
   message (`content`, `details`, `isError`) and projects them to ReqLLM.
+  `{:ok, {:parts, parts}}` outputs (built with `text_part/1` / `image_part/2`)
+  become multi-part `content`; image parts project to `ContentPart.image/2`.
 - `Tools` — registry + guarded pipeline (`lookup/2`, `schemas/1`,
   `execute/3`); typed results `{:ok, _}` | `{:error, %{type:, message:}}` with
   `:type ∈ {:unknown_tool, :denied, :crashed}`.
 - `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`.
 - `Tools.{Read, Write, Edit, Glob, Grep, Executor, TodoWrite, Skill, Recompile}` — the built-ins.
+  `Read` returns image files (png/jpeg/gif/webp, ≤ 5 MB) as viewable image
+  parts, or a text description when the env's `vision?` is false.
   `Tools.Walk` is the shared deterministic, symlink-safe, prune-aware walk and
   glob compiler used by `glob`/`grep`; `TodoWrite` also emits `:"tools/todo"`.
 - `Executor.Runner` — port executor: merges stdout/stderr, treats a settled

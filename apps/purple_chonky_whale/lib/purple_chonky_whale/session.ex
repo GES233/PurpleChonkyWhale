@@ -22,6 +22,14 @@ defmodule PurpleChonkyWhale.Session do
     * `:"tool/result"` — canonical `%{"message" => toolResult}` or the legacy
       flat `%{tool_call_id, name, output}` payload
 
+  Binary image payloads (content parts built with
+  `PurpleChonkyWhale.ToolResult.image_part/2`) never enter the log: on append
+  they are written to a content-addressed blob file under `<dir>/blobs/` and
+  the event stores a `%{"type" => "image", "blob" => filename, "mediaType",
+  "bytes"}` reference; projection rehydrates the binary (or degrades to a
+  text placeholder if the blob is missing). Blobs are shared across the
+  sessions in `dir`, deduplicated by content hash.
+
   An assistant tool-call batch is indivisible in the provider projection:
   results are emitted in assistant call order, and messages that arrived while
   the batch was open are emitted after its results. Projecting an unsettled
@@ -81,7 +89,8 @@ defmodule PurpleChonkyWhale.Session do
   @doc "The model-visible projection: events folded into `ReqLLM.Message`s."
   @spec messages(pid()) :: [ReqLLM.Message.t()]
   def messages(pid) do
-    pid |> events() |> project_events()
+    {events, dir} = GenServer.call(pid, :projection_source)
+    project_events(events, blob_dir(dir))
   end
 
   @doc """
@@ -130,6 +139,7 @@ defmodule PurpleChonkyWhale.Session do
     {:ok,
      %{
        id: id,
+       dir: dir,
        path: path,
        scope: scope,
        header: header,
@@ -195,6 +205,13 @@ defmodule PurpleChonkyWhale.Session do
     {:reply, Enum.reverse(state.events_rev), state}
   end
 
+  # Projection runs caller-side so an invalid log raises in the caller instead
+  # of killing the session process; blob rehydration needs the dir, so the
+  # server hands over both.
+  def handle_call(:projection_source, _from, state) do
+    {:reply, {Enum.reverse(state.events_rev), state.dir}, state}
+  end
+
   defp normalize_id_set(nil), do: nil
   defp normalize_id_set(%MapSet{} = set), do: set
   defp normalize_id_set(list) when is_list(list), do: MapSet.new(list, &to_string/1)
@@ -230,7 +247,7 @@ defmodule PurpleChonkyWhale.Session do
       parent_id: state.last_event_id,
       type: type,
       at: System.system_time(:millisecond),
-      data: sanitize(data)
+      data: data |> externalize_media(state.dir) |> sanitize()
     }
 
     persist!(state, event)
@@ -293,8 +310,9 @@ defmodule PurpleChonkyWhale.Session do
 
   ## Projection
 
-  defp project_events(events) do
-    {messages_rev, batch} = Enum.reduce(events, {[], nil}, &project_event/2)
+  defp project_events(events, blob_dir) do
+    {messages_rev, batch} =
+      Enum.reduce(events, {[], nil}, fn event, acc -> project_event(event, acc, blob_dir) end)
 
     if batch do
       unsettled = Enum.reject(batch.ids, &Map.has_key?(batch.results, &1))
@@ -304,13 +322,13 @@ defmodule PurpleChonkyWhale.Session do
     Enum.reverse(messages_rev)
   end
 
-  defp project_event(%{type: :"tool/result", data: data} = event, {_out, nil}) do
-    message = canonical_result(data, event.at)
+  defp project_event(%{type: :"tool/result", data: data} = event, {_out, nil}, blob_dir) do
+    message = data |> canonical_result(event.at) |> rehydrate_media(blob_dir)
     raise ArgumentError, "tool result has no open tool-call batch: #{message["toolCallId"]}"
   end
 
-  defp project_event(%{type: :"tool/result", data: data} = event, {out, batch}) do
-    message = canonical_result(data, event.at)
+  defp project_event(%{type: :"tool/result", data: data} = event, {out, batch}, blob_dir) do
+    message = data |> canonical_result(event.at) |> rehydrate_media(blob_dir)
     id = message["toolCallId"]
 
     if id in batch.ids and not Map.has_key?(batch.results, id) do
@@ -322,7 +340,7 @@ defmodule PurpleChonkyWhale.Session do
 
         batch.deferred
         |> Enum.reverse()
-        |> Enum.reduce({out, nil}, &project_event/2)
+        |> Enum.reduce({out, nil}, fn deferred, acc -> project_event(deferred, acc, blob_dir) end)
       else
         {out, batch}
       end
@@ -331,7 +349,7 @@ defmodule PurpleChonkyWhale.Session do
     end
   end
 
-  defp project_event(%{type: type} = event, {out, batch})
+  defp project_event(%{type: type} = event, {out, batch}, _blob_dir)
        when type in [:"system/message", :"user/message", :"assistant/message"] do
     if batch do
       {out, %{batch | deferred: [event | batch.deferred]}}
@@ -343,7 +361,7 @@ defmodule PurpleChonkyWhale.Session do
     end
   end
 
-  defp project_event(_event, state), do: state
+  defp project_event(_event, state, _blob_dir), do: state
 
   defp project_message(%{type: :"system/message", data: data}) do
     {ReqLLM.Context.system(data["content"]), []}
@@ -447,6 +465,60 @@ defmodule PurpleChonkyWhale.Session do
   defp canonical_result(data, at), do: ToolResult.from_legacy(data, at)
 
   defp emit(out, messages), do: Enum.reverse(messages, out)
+
+  ## Media blobs
+
+  defp blob_dir(dir), do: Path.join(dir, "blobs")
+
+  # Image parts cross the boundary with raw binaries; the log keeps only a
+  # content-addressed reference so JSONL stays lean and replays stay cheap.
+  defp externalize_media(%{"type" => "image", "data" => data} = part, dir)
+       when is_binary(data) and byte_size(data) > 0 do
+    part
+    |> Map.delete("data")
+    |> Map.put("blob", write_blob(dir, data, part["mediaType"]))
+    |> Map.put("bytes", byte_size(data))
+  end
+
+  defp externalize_media(map, dir) when is_map(map) do
+    Map.new(map, fn {key, value} -> {key, externalize_media(value, dir)} end)
+  end
+
+  defp externalize_media(list, dir) when is_list(list),
+    do: Enum.map(list, &externalize_media(&1, dir))
+
+  defp externalize_media(term, _dir), do: term
+
+  defp write_blob(dir, data, media_type) do
+    hash = :crypto.hash(:sha256, data) |> Base.encode16(case: :lower)
+    filename = hash <> blob_extension(media_type)
+    File.mkdir_p!(blob_dir(dir))
+    path = Path.join(blob_dir(dir), filename)
+    unless File.exists?(path), do: File.write!(path, data)
+    filename
+  end
+
+  defp blob_extension("image/jpeg"), do: ".jpg"
+  defp blob_extension("image/png"), do: ".png"
+  defp blob_extension("image/gif"), do: ".gif"
+  defp blob_extension("image/webp"), do: ".webp"
+  defp blob_extension(_media_type), do: ".bin"
+
+  defp rehydrate_media(message, blob_dir) do
+    Map.update(message, "content", [], fn parts ->
+      Enum.map(parts, &rehydrate_part(&1, blob_dir))
+    end)
+  end
+
+  defp rehydrate_part(%{"type" => "image", "blob" => blob} = part, blob_dir)
+       when is_binary(blob) do
+    case File.read(Path.join(blob_dir, Path.basename(blob))) do
+      {:ok, data} -> part |> Map.delete("blob") |> Map.put("data", data)
+      {:error, _} -> %{"type" => "text", "text" => "[image unavailable: blob #{blob} is missing]"}
+    end
+  end
+
+  defp rehydrate_part(part, _blob_dir), do: part
 
   ## Tool-call index
 

@@ -66,7 +66,7 @@ defmodule PurpleChonkyWhale.Presets do
         component: Tools,
         config: [
           tools: tools_for(persona),
-          env: %{cwd: cwd, skill_dirs: skill_dirs(home, persona, cwd)}
+          env: %{cwd: cwd, skill_dirs: skill_dirs(home, persona, cwd), vision?: vision?(model)}
         ]
       }
     ]
@@ -149,6 +149,25 @@ defmodule PurpleChonkyWhale.Presets do
       home -> Path.join(home, ".pcw")
     end
   end
+
+  # Whether the model accepts image input, per the LLMDB catalog. Unknown
+  # models (or catalog entries without modality data) fail open: the provider
+  # is the final arbiter.
+  defp vision?(%LLMDB.Model{modalities: %{input: input}}) when is_list(input),
+    do: :image in input
+
+  defp vision?(%LLMDB.Model{}), do: true
+
+  defp vision?(%{modalities: %{input: input}}) when is_list(input), do: :image in input
+
+  defp vision?(model) when is_binary(model) or is_tuple(model) do
+    case LLMDB.model(model) do
+      {:ok, %LLMDB.Model{} = resolved} -> vision?(resolved)
+      _ -> true
+    end
+  end
+
+  defp vision?(_model), do: true
 
   defp skill_dirs(home, persona, cwd) do
     workspace = Enum.map([".agents/skills", ".claude/skills", "skills"], &Path.join(cwd, &1))

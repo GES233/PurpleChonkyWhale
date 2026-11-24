@@ -33,6 +33,11 @@ defmodule PurpleChonkyWhale.Tool do
   `PurpleChonkyWhale.Tools`). It returns `{:ok, output}` — any JSON-encodable
   term — or `{:error, reason}`; an uncaught exception is caught by the
   pipeline and reported as `{:error, %{type: :crashed}}`.
+
+  For multi-part output (e.g. text plus an image), return
+  `{:ok, {:parts, parts}}` with parts built by
+  `PurpleChonkyWhale.ToolResult.text_part/1` and
+  `PurpleChonkyWhale.ToolResult.image_part/2`.
   """
 
   @typedoc "A tool's declarative schema; `parameters` is a JSON Schema map."

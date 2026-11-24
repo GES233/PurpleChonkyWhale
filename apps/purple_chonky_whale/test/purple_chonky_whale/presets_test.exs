@@ -112,4 +112,24 @@ defmodule PurpleChonkyWhale.PresetsTest do
     assert tutor =~ "read/glob/grep"
     assert tutor =~ "but cannot"
   end
+
+  test "the tools env carries vision? from the model's input modalities", %{tmp_dir: tmp_dir} do
+    vision? = fn model ->
+      Presets.entries(:personal, home: tmp_dir, model: model)
+      |> entry(:tools)
+      |> Map.fetch!(:config)
+      |> Keyword.fetch!(:env)
+      |> Map.fetch!(:vision?)
+    end
+
+    text_only = LLMDB.Model.new!(%{id: "t", provider: :acme, modalities: %{input: [:text]}})
+
+    sighted =
+      LLMDB.Model.new!(%{id: "v", provider: :acme, modalities: %{input: [:text, :image]}})
+
+    assert vision?.(text_only) == false
+    assert vision?.(sighted) == true
+    # Models unknown to the catalog fail open; the provider is the final arbiter.
+    assert vision?.("acme:not-in-the-catalog") == true
+  end
 end

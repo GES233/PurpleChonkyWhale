@@ -33,6 +33,7 @@ defmodule PurpleChonkyWhale.MixProject do
 
       # LLM Support
       {:req_llm, "~> 1.6"},
+      {:llm_db, ">= 2026.9.5"},
 
       # Serialization
       {:jason, "~> 1.4"},

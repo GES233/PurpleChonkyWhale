@@ -7,6 +7,11 @@ defmodule PurpleChonkyWhale.ToolResult do
   shape: model-visible `content`, machine/UI `details`, and an `isError` flag
   that describes tool settlement rather than a subprocess's exit status.
 
+  `output` is normally any JSON-encodable term (wrapped as one text part), or
+  `{:parts, parts}` for multi-part results — parts built with `text_part/1`
+  and `image_part/2`. Image parts carry raw binaries at the boundary; the
+  session log externalizes them into blob files (see `PurpleChonkyWhale.Session`).
+
   Legacy flat `tool/result` payloads are normalized in memory during replay;
   their disk representation is not rewritten.
   """
@@ -21,17 +26,27 @@ defmodule PurpleChonkyWhale.ToolResult do
   @spec from_result(String.t(), String.t(), {:ok, term()} | {:error, term()}, integer()) ::
           message()
   def from_result(tool_call_id, tool_name, result, timestamp \\ now()) do
-    {is_error, text, details} = normalize(result)
+    {is_error, content, details} = normalize(result)
 
     %{
       "role" => "toolResult",
       "toolCallId" => tool_call_id,
       "toolName" => tool_name,
-      "content" => [%{"type" => "text", "text" => text}],
+      "content" => content,
       "details" => details,
       "isError" => is_error,
       "timestamp" => timestamp
     }
+  end
+
+  @doc "Build a text content part for a `{:parts, ...}` tool output."
+  @spec text_part(String.t()) :: map()
+  def text_part(text), do: %{"type" => "text", "text" => text}
+
+  @doc "Build an image content part (raw binary + media type) for a `{:parts, ...}` tool output."
+  @spec image_part(binary(), String.t()) :: map()
+  def image_part(data, media_type) when is_binary(data) do
+    %{"type" => "image", "data" => data, "mediaType" => media_type}
   end
 
   @doc """
@@ -104,6 +119,7 @@ defmodule PurpleChonkyWhale.ToolResult do
     content =
       Enum.map(message["content"] || [], fn
         %{"type" => "text", "text" => text} -> ContentPart.text(text)
+        %{"type" => "image", "data" => data} = part -> image_content_part(part, data)
         %{"text" => text} -> ContentPart.text(text)
         other -> ContentPart.text(encode_output(other))
       end)
@@ -116,10 +132,16 @@ defmodule PurpleChonkyWhale.ToolResult do
     )
   end
 
-  defp normalize({:ok, output}), do: {false, encode_output(output), %{}}
+  defp image_content_part(part, data) do
+    ContentPart.image(data, part["mediaType"] || "image/png")
+  end
+
+  defp normalize({:ok, {:parts, parts}}) when is_list(parts), do: {false, parts, %{}}
+
+  defp normalize({:ok, output}), do: {false, [text_part(encode_output(output))], %{}}
 
   defp normalize({:error, reason}) do
-    {true, error_message(reason), %{"error" => error_record(reason)}}
+    {true, [text_part(error_message(reason))], %{"error" => error_record(reason)}}
   end
 
   defp encode_output(output) when is_binary(output), do: output
