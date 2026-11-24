@@ -16,7 +16,8 @@ defmodule PurpleChonkyWhale.Session do
     * `:"system/message"` — `%{content}`
     * `:"user/message"` — `%{content}`; an optional `"userId"` marks the
       speaker in multi-actor logs (the projection prefixes it so the model
-      can tell speakers apart)
+      can tell speakers apart); an optional `"parts"` list carries
+      attachments (text/image content parts) alongside the text
     * `:"assistant/message"` — `%{content, thinking, reasoning_details, tool_calls: [%{id, name, input, metadata}]}`
       (`thinking`, `reasoning_details`, and `tool_calls` optional)
     * `:"tool/result"` — canonical `%{"message" => toolResult}` or the legacy
@@ -349,12 +350,12 @@ defmodule PurpleChonkyWhale.Session do
     end
   end
 
-  defp project_event(%{type: type} = event, {out, batch}, _blob_dir)
+  defp project_event(%{type: type} = event, {out, batch}, blob_dir)
        when type in [:"system/message", :"user/message", :"assistant/message"] do
     if batch do
       {out, %{batch | deferred: [event | batch.deferred]}}
     else
-      case project_message(event) do
+      case project_message(event, blob_dir) do
         {message, []} -> {[message | out], nil}
         {message, ids} -> {[message | out], %{ids: ids, results: %{}, deferred: []}}
       end
@@ -363,15 +364,31 @@ defmodule PurpleChonkyWhale.Session do
 
   defp project_event(_event, state, _blob_dir), do: state
 
-  defp project_message(%{type: :"system/message", data: data}) do
+  defp project_message(%{type: :"system/message", data: data}, _blob_dir) do
     {ReqLLM.Context.system(data["content"]), []}
   end
 
-  defp project_message(%{type: :"user/message", data: data}) do
-    {ReqLLM.Context.user(prefix_actor(data["content"], data["userId"])), []}
+  # A user message may carry attachments in "parts" (see
+  # `PurpleChonkyWhale.ToolResult.text_part/1` and `image_part/2`); image parts
+  # are rehydrated from blobs like tool results are. Without parts the message
+  # projects as plain text, exactly as before.
+  defp project_message(%{type: :"user/message", data: data}, blob_dir) do
+    case data["parts"] do
+      parts when is_list(parts) and parts != [] ->
+        text = prefix_actor(data["content"] || "", data["userId"])
+
+        content =
+          if(text == "", do: [], else: [ReqLLM.Message.ContentPart.text(text)]) ++
+            Enum.map(parts, &(&1 |> rehydrate_part(blob_dir) |> project_user_part()))
+
+        {ReqLLM.Context.user(content), []}
+
+      _ ->
+        {ReqLLM.Context.user(prefix_actor(data["content"], data["userId"])), []}
+    end
   end
 
-  defp project_message(%{type: :"assistant/message", data: data}) do
+  defp project_message(%{type: :"assistant/message", data: data}, _blob_dir) do
     tool_calls =
       for call <- data["tool_calls"] || [] do
         project_tool_call(call)
@@ -385,6 +402,18 @@ defmodule PurpleChonkyWhale.Session do
 
     ids = Enum.map(data["tool_calls"] || [], & &1["id"])
     {message, ids}
+  end
+
+  defp project_user_part(%{"type" => "image", "data" => data} = part) do
+    ReqLLM.Message.ContentPart.image(data, part["mediaType"] || "image/png")
+  end
+
+  defp project_user_part(%{"type" => "text", "text" => text}) do
+    ReqLLM.Message.ContentPart.text(text)
+  end
+
+  defp project_user_part(other) do
+    ReqLLM.Message.ContentPart.text(Jason.encode!(other))
   end
 
   # Multi-actor logs (e.g. a work session with several members) carry a

@@ -56,6 +56,9 @@ defmodule PurpleChonkyWhale.AgentRun do
     * `:run_id` — explicit run identifier (default `generate_id/0`)
     * `:session_id` — session identifier override (default `Session.id(session)`)
     * `:prompt` — user message string to append before `:"run/start"`
+    * `:parts` — optional content parts (attachments) stored on the prompt's
+      `:"user/message"` event, e.g. images built with
+      `PurpleChonkyWhale.ToolResult.image_part/2`
     * `:max_steps` — step budget (default `100`)
     * `:tool_concurrency` — max concurrent tool calls per batch
     * `:supervisor` — `%AgentRunSupervisor{}` handle (defaults to the
@@ -139,11 +142,16 @@ defmodule PurpleChonkyWhale.AgentRun do
       {:ok, _} = Session.seal_unsettled(session, type: :outcome_unknown)
 
       if prompt = Keyword.get(opts, :prompt) do
-        {:ok, _} =
-          Session.append(session, :"user/message", %{
-            "content" => prompt,
-            "runId" => run_id
-          })
+        data =
+          case Keyword.get(opts, :parts) do
+            parts when is_list(parts) and parts != [] ->
+              %{"content" => prompt, "runId" => run_id, "parts" => parts}
+
+            _ ->
+              %{"content" => prompt, "runId" => run_id}
+          end
+
+        {:ok, _} = Session.append(session, :"user/message", data)
       end
 
       {:ok, _} =

@@ -63,6 +63,8 @@ temp file).
   supervisor/registry (`:runs` when mounted as a component). `start/1`,
   `await/2`, `cancel/2`, `steer/2`, `status/1`; every run settles at most once,
   and terminal state is durable even though the process is `:temporary`.
+  `start/1` accepts `:parts` to attach content parts (e.g. images) to the
+  prompt's `user/message` event.
 - `LLM` / `LLM.Client` — component and the client consumers get. `:backend`
   defaults to `ReqLLM` and is swapped for a fake in tests.
 - `Sessions` / `Session` — store handle and the append-only JSONL log
@@ -75,7 +77,9 @@ temp file).
   content-addressed files under `<dir>/blobs/`, the event keeps a
   `%{"type" => "image", "blob", "mediaType", "bytes"}` reference, and
   projection rehydrates the bytes (a missing blob degrades to a text
-  placeholder, never a projection failure).
+  placeholder, never a projection failure). This applies to any event;
+  `user/message` attachments ride the optional `"parts"` key and project to
+  a multi-part user message.
 - `Presets` — **moved to the `noctilucent` app** (`Noctilucent.Presets`):
   persona compositions are application policy, not kernel. The kernel keeps
   only the conventions the presets rely on: the `:tools` env keys `:cwd`,
@@ -90,7 +94,9 @@ temp file).
 - `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`.
 - `Tools.{Read, Write, Edit, Glob, Grep, Executor, TodoWrite, Skill, Recompile}` — the built-ins.
   `Read` returns image files (png/jpeg/gif/webp, ≤ 5 MB) as viewable image
-  parts, or a text description when the env's `vision?` is false.
+  parts, or a text description when the env's `vision?` is false; its
+  `image_media_type/1` / `max_image_bytes/0` helpers are public so front ends
+  (e.g. the Noctilucent CLI's `@path` attachments) share the same policy.
   `Tools.Walk` is the shared deterministic, symlink-safe, prune-aware walk and
   glob compiler used by `glob`/`grep`; `TodoWrite` also emits `:"tools/todo"`.
 - `Executor.Runner` — port executor: merges stdout/stderr, treats a settled

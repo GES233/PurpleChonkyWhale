@@ -57,11 +57,25 @@ defmodule PurpleChonkyWhale.Tools.Read do
   def execute(args, env) do
     path = Tool.resolve_path(env, args["file_path"])
 
-    case Map.fetch(@image_media_types, path |> Path.extname() |> String.downcase()) do
+    case image_media_type(path) do
       {:ok, media_type} -> read_image(path, media_type, env)
       :error -> read_text(path, args)
     end
   end
+
+  @doc """
+  `{:ok, media_type}` when `path`'s extension names a supported image format
+  (case-insensitive), `:error` otherwise. Shared with callers that attach
+  images to user messages (e.g. the Noctilucent CLI).
+  """
+  @spec image_media_type(String.t()) :: {:ok, String.t()} | :error
+  def image_media_type(path) do
+    Map.fetch(@image_media_types, path |> Path.extname() |> String.downcase())
+  end
+
+  @doc "The maximum image payload the tool will return, in bytes."
+  @spec max_image_bytes() :: non_neg_integer()
+  def max_image_bytes, do: @max_image_bytes
 
   defp read_text(path, args) do
     offset = max(1, Map.get(args, "offset", 1))

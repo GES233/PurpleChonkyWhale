@@ -261,6 +261,38 @@ defmodule PurpleChonkyWhale.SessionTest do
       assert [%{data: %{"userId" => "alice"}} | _] = Session.events(pid)
     end
 
+    test "user message parts carry image attachments through blob storage and projection", %{
+      dir: dir,
+      scope: scope
+    } do
+      png = <<137, 80, 78, 71, 13, 10, 26, 10, 9, 9>>
+      pid = open_session(dir, scope, :attach)
+
+      {:ok, event} =
+        Session.append(pid, :"user/message", %{
+          "userId" => "alice",
+          "content" => "what is this?",
+          "parts" => [ToolResult.image_part(png, "image/png")]
+        })
+
+      [part] = event.data["parts"]
+      refute Map.has_key?(part, "data")
+      assert part["blob"] =~ ".png"
+
+      assert [user] = Session.messages(pid)
+
+      assert [
+               %{type: :text, text: "alice: what is this?"},
+               %{type: :image, data: ^png, media_type: "image/png"}
+             ] = user.content
+
+      # A missing blob degrades that part to a text placeholder.
+      File.rm!(Path.join([dir, "blobs", part["blob"]]))
+      assert [user] = Session.messages(pid)
+      assert [%{type: :text}, %{type: :text, text: placeholder}] = user.content
+      assert placeholder =~ "image unavailable"
+    end
+
     test "canonical results preserve JSON success and structured errors", %{
       dir: dir,
       scope: scope
