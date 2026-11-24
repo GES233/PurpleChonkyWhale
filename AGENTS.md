@@ -10,15 +10,17 @@ Apps:
   built-in tools). All architecture invariants are documented in its
   AGENTS.md.
 - `apps/noctilucent` — the personal agent application, depends on
-  `purple_chonky_whale` via `in_umbrella: true`.
+  `purple_chonky_whale` via `in_umbrella: true`. Owns the persona presets
+  (`Noctilucent.Presets`: coding / personal / tutor compositions of model,
+  session dir, tool set and skill chain).
 - `apps/nacreous` — the work agent application, same dependency.
 
 Umbrella-level rules:
 
 - Run `mix test` / `mix format` from this root; formatting is governed by the
   root `.formatter.exs` (`subdirectories: ["apps/*"]`) plus each app's own
-  `.formatter.exs`. `apps/purple_chonky_whale/examples/` is intentionally
-  excluded from formatting.
+  `.formatter.exs`. `apps/*/examples/` is intentionally excluded from
+  formatting.
 - Shared compile-time config (e.g. the codepagex whitelist) lives in the root
   `config/config.exs`; app-specific config goes under each app.
 - Dependencies are vendored at the root `deps/`; Dexterous apps come from a

@@ -9,7 +9,7 @@ this tree; nothing is aspirational.
 
 ```sh
 mix compile            # deps are vendored under deps/; Dexterous apps come from a sparse checkout
-mix test               # 126 tests / 1 doctest, ~5s; runtimes are skipped when absent
+mix test               # 117 tests / 1 doctest, ~5s; runtimes are skipped when absent
 mix format             # .formatter.exs covers mix.exs, config/, lib/, test/ — NOT examples/
 ```
 
@@ -76,12 +76,10 @@ temp file).
   `%{"type" => "image", "blob", "mediaType", "bytes"}` reference, and
   projection rehydrates the bytes (a missing blob degrades to a text
   placeholder, never a projection failure).
-- `Presets` — persona compositions for `:coding`/`:personal`/`:tutor` as
-  ready-made entry lists (`entries/2`) plus per-persona system prompts
-  (`system_prompt/2`): per-persona sessions dirs, per-persona tool sets, and
-  a workspace → persona → global skill directory chain. The `:tools` env
-  carries `vision?`, derived from the model's LLMDB input modalities
-  (`:image` present); unknown models fail open.
+- `Presets` — **moved to the `noctilucent` app** (`Noctilucent.Presets`):
+  persona compositions are application policy, not kernel. The kernel keeps
+  only the conventions the presets rely on: the `:tools` env keys `:cwd`,
+  `:skill_dirs` and `:vision?` (whether the model accepts image input).
 - `ToolResult` — converts callback results to the canonical `toolResult`
   message (`content`, `details`, `isError`) and projects them to ReqLLM.
   `{:ok, {:parts, parts}}` outputs (built with `text_part/1` / `image_part/2`)

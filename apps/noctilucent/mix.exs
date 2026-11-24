@@ -24,7 +24,9 @@ defmodule Noctilucent.MixProject do
 
   defp deps do
     [
-      {:purple_chonky_whale, in_umbrella: true}
+      {:purple_chonky_whale, in_umbrella: true},
+      {:dexterous_loader, github: "GES233/Dexterous", sparse: "apps/dexterous_loader"},
+      {:llm_db, ">= 2026.11.6"}
     ]
   end
 end

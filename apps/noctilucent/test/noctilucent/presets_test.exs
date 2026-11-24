@@ -1,9 +1,10 @@
-defmodule PurpleChonkyWhale.PresetsTest do
+defmodule Noctilucent.PresetsTest do
   use ExUnit.Case, async: true
 
   @moduletag :tmp_dir
 
-  alias PurpleChonkyWhale.{LLM, Presets, Sessions, Tools}
+  alias Noctilucent.Presets
+  alias PurpleChonkyWhale.{LLM, Sessions, Tools}
   alias DexterousLoader.Entry
 
   defp entry(entries, id), do: Enum.find(entries, &(&1.id == id))

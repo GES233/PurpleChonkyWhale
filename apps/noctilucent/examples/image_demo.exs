@@ -2,15 +2,16 @@
 # describes it. Requires a vision-capable model (API key from env or .env).
 # Run from the umbrella root so the root .env is picked up:
 #
-#   mix run apps/purple_chonky_whale/examples/image_demo.exs anthropic:claude-sonnet-4-5
-#   mix run apps/purple_chonky_whale/examples/image_demo.exs openai:gpt-4o path/to/other.png
+#   mix run apps/noctilucent/examples/image_demo.exs anthropic:claude-sonnet-4-5
+#   mix run apps/noctilucent/examples/image_demo.exs openai:gpt-4o path/to/other.png
 #   PCW_DEMO_BASE_URL=https://api.kimi.com/coding \
-#     mix run apps/purple_chonky_whale/examples/image_demo.exs anthropic:kimi-for-coding
+#     mix run apps/noctilucent/examples/image_demo.exs anthropic:kimi-for-coding
 #
 # Without an image argument the script paints a deterministic test PNG
 # (three horizontal stripes: red, green, blue) into tmp and uses that.
 
-alias PurpleChonkyWhale.{AgentLoop, Presets, Session, Sessions}
+alias Noctilucent.Presets
+alias PurpleChonkyWhale.{AgentLoop, Session, Sessions}
 alias Dexterous.Context
 
 model = System.argv() |> List.first() || raise "usage: mix run examples/image_demo.exs MODEL [image]"

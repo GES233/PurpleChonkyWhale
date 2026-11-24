@@ -1,4 +1,4 @@
-defmodule PurpleChonkyWhale.Presets do
+defmodule Noctilucent.Presets do
   @moduledoc """
   Persona presets: ready-made compositions for the built-in agent personas
   `:coding`, `:personal` and `:tutor`.
