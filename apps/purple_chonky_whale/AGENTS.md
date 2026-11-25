@@ -105,9 +105,13 @@ temp file).
 - `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`.
 - `Tools.{Read, Write, Edit, Glob, Grep, Executor, TodoWrite, Skill, Recompile}` — the built-ins.
   `Read` returns image files (png/jpeg/gif/webp, ≤ 5 MB) as viewable image
-  parts, or a text description when the env's `vision?` is false; its
-  `image_media_type/1` / `max_image_bytes/0` helpers are public so front ends
-  (e.g. the Noctilucent CLI's `@path` attachments) share the same policy.
+  parts, or a text description when the env's `vision?` is false or the bytes
+  fail the structural check of `valid_image_data?/2` (PNG signature+IEND,
+  JPEG SOI/EOI, GIF header+trailer, WebP RIFF header — corrupt/truncated
+  files must never enter the session log: one bad image makes the provider
+  reject every later request); its `image_media_type/1` / `max_image_bytes/0`
+  / `valid_image_data?/2` helpers are public so front ends (e.g. the
+  Noctilucent CLI's `@path` attachments) share the same policy.
   `Tools.Walk` is the shared deterministic, symlink-safe, prune-aware walk and
   glob compiler used by `glob`/`grep`; `TodoWrite` also emits `:"tools/todo"`.
 - `Executor.Runner` — port executor: merges stdout/stderr, treats a settled

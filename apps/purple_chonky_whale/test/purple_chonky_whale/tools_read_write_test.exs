@@ -76,8 +76,10 @@ defmodule PurpleChonkyWhale.Tools.ReadWriteTest do
   end
 
   describe "read (images)" do
-    # PNG magic header plus filler; the tool treats bytes opaquely.
-    @png <<137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3>>
+    # PNG signature plus filler and a trailing IEND chunk: structurally
+    # complete as far as the tool's check is concerned.
+    @png <<137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 0, 0, 0, 0, "IEND", 0xAE, 0x42, 0x60, 0x82>>
+    @jpeg <<0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9>>
 
     test "image files come back as an image part plus a text note", %{env: env, dir: dir} do
       File.write!(Path.join(dir, "pic.png"), @png)
@@ -90,10 +92,30 @@ defmodule PurpleChonkyWhale.Tools.ReadWriteTest do
     end
 
     test "extensions match case-insensitively", %{env: env, dir: dir} do
-      File.write!(Path.join(dir, "PIC.JPEG"), @png)
+      File.write!(Path.join(dir, "PIC.JPEG"), @jpeg)
 
       assert {:ok, {:parts, [%{"mediaType" => "image/jpeg"} | _]}} =
                Read.execute(%{"file_path" => "PIC.JPEG"}, env)
+    end
+
+    test "a corrupt or truncated image degrades to a text description", %{env: env, dir: dir} do
+      # PNG signature plus junk, no IEND chunk — like a truncated write.
+      File.write!(Path.join(dir, "stub.png"), <<137, 80, 78, 71, 13, 10, 26, 10, 7, 7>>)
+
+      assert {:ok, text} = Read.execute(%{"file_path" => "stub.png"}, env)
+      assert text =~ "corrupt or truncated"
+      assert text =~ "stub.png"
+    end
+
+    test "valid_image_data?/2 checks structure per format" do
+      assert Read.valid_image_data?(@png, "image/png")
+      refute Read.valid_image_data?(<<137, 80, 78, 71, 13, 10, 26, 10>>, "image/png")
+      assert Read.valid_image_data?(@jpeg, "image/jpeg")
+      refute Read.valid_image_data?(@png, "image/jpeg")
+      assert Read.valid_image_data?(<<"GIF89a", 0, 0, 0x3B>>, "image/gif")
+      refute Read.valid_image_data?(<<"GIF89a", 0, 0>>, "image/gif")
+      assert Read.valid_image_data?(<<"RIFF", 0, 0, 0, 0, "WEBP", 0>>, "image/webp")
+      refute Read.valid_image_data?(<<"RIFF", 0, 0, 0, 0, "AVI ", 0>>, "image/webp")
     end
 
     test "vision?: false answers with a text description instead of the image", %{

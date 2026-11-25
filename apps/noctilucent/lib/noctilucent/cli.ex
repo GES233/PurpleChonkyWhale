@@ -24,7 +24,8 @@ defmodule Noctilucent.CLI do
 
   Attach images inline with `@path/to/image.png` (png/jpeg/gif/webp, ≤ 5 MB,
   resolved against the working directory); attachments are ignored with a
-  notice when the model has no image input.
+  notice when the model has no image input, and corrupt or truncated files
+  are skipped with a notice.
 
   The terminal rendering is driven entirely by seam events (`llm/chunk`,
   `tools/post-execute`, `tools/todo`); the REPL itself only appends
@@ -241,13 +242,25 @@ defmodule Noctilucent.CLI do
     with {:ok, media_type} <- PurpleChonkyWhale.Tools.Read.image_media_type(path),
          {:ok, %{size: size}} <- File.stat(path),
          :ok <- check_attach_size(token, size),
-         {:ok, data} <- File.read(path) do
+         {:ok, data} <- File.read(path),
+         :ok <- check_attach_valid(token, data, media_type) do
       {:ok, PurpleChonkyWhale.ToolResult.image_part(data, media_type),
        "attached @#{token} (#{media_type}, #{size} bytes)"}
     else
       :error -> :not_an_image
       {:error, _} -> :not_an_image
       {:skip, notice} -> {:skip, notice}
+    end
+  end
+
+  # A corrupt or truncated image must never enter the session log: it rides
+  # along on every later request, and one bad image makes the provider reject
+  # the whole payload. Same policy as the read tool.
+  defp check_attach_valid(token, data, media_type) do
+    if PurpleChonkyWhale.Tools.Read.valid_image_data?(data, media_type) do
+      :ok
+    else
+      {:skip, "skipped @#{token}: corrupt or truncated image (not a complete #{media_type} file)"}
     end
   end
 

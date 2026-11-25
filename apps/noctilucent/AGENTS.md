@@ -19,7 +19,8 @@ stays generic.
   `lib/mix/tasks/noctilucent.ex`). Multi-turn over one session log, slash
   commands `/quit` `/cancel` `/steer` `/reset` `/sessions` `/resume` `/log`,
   inline image attachments via `@path/to/img.png` (truncated trailing
-  punctuation is stripped from tokens). A fresh session is seeded with the
+  punctuation is stripped from tokens; corrupt/truncated images are skipped
+  with a notice via the read tool's `valid_image_data?/2`). A fresh session is seeded with the
   persona's system prompt plus the recalled memory as a second
   `system/message` (recalled memory is model-visible, therefore logged);
   resumed sessions keep their log untouched. Rendering is driven by seam

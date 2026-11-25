@@ -13,6 +13,12 @@ defmodule PurpleChonkyWhale.Tools.Read do
   over 5 MB are refused with a hint to downscale. When the environment
   carries `vision?: false` (the configured model has no image input), the
   tool answers with a text description of the file instead of the image.
+
+  Before the bytes leave the tool they pass a structural check (see
+  `valid_image_data?/2`): a file that fails it is answered with the same
+  text description plus a corrupt/truncated note. Undecodable bytes must
+  never enter the session log — the image rides along on every later
+  request, and one bad image makes the provider reject the whole payload.
   """
 
   @behaviour PurpleChonkyWhale.Tool
@@ -20,6 +26,10 @@ defmodule PurpleChonkyWhale.Tools.Read do
   alias PurpleChonkyWhale.{Tool, ToolResult}
 
   @max_image_bytes 5 * 1024 * 1024
+
+  @png_signature <<137, 80, 78, 71, 13, 10, 26, 10>>
+  # The IEND chunk has a fixed payload (none), so its CRC is a constant.
+  @png_iend <<0, 0, 0, 0, "IEND", 0xAE, 0x42, 0x60, 0x82>>
 
   @image_media_types %{
     ".png" => "image/png",
@@ -77,6 +87,35 @@ defmodule PurpleChonkyWhale.Tools.Read do
   @spec max_image_bytes() :: non_neg_integer()
   def max_image_bytes, do: @max_image_bytes
 
+  @doc """
+  Whether `data` is a structurally complete image of `media_type`: PNG needs
+  its signature plus a trailing IEND chunk, JPEG its SOI/EOI markers, GIF a
+  `GIF87a`/`GIF89a` header plus the trailer byte, WebP a RIFF/WEBP header.
+  This is not a full decode — it catches the corrupt or truncated files a
+  provider would reject. Shared with callers that attach images to user
+  messages (e.g. the Noctilucent CLI).
+  """
+  @spec valid_image_data?(binary(), String.t()) :: boolean()
+  def valid_image_data?(data, media_type)
+
+  def valid_image_data?(data, "image/png") do
+    String.starts_with?(data, @png_signature) and String.ends_with?(data, @png_iend)
+  end
+
+  def valid_image_data?(data, "image/jpeg") do
+    String.starts_with?(data, <<0xFF, 0xD8>>) and String.ends_with?(data, <<0xFF, 0xD9>>)
+  end
+
+  def valid_image_data?(data, "image/gif") do
+    (String.starts_with?(data, "GIF87a") or String.starts_with?(data, "GIF89a")) and
+      String.ends_with?(data, <<0x3B>>)
+  end
+
+  def valid_image_data?(data, "image/webp") do
+    byte_size(data) >= 12 and binary_part(data, 0, 4) == "RIFF" and
+      binary_part(data, 8, 4) == "WEBP"
+  end
+
   defp read_text(path, args) do
     offset = max(1, Map.get(args, "offset", 1))
     limit = max(1, Map.get(args, "limit", 2000))
@@ -103,12 +142,16 @@ defmodule PurpleChonkyWhale.Tools.Read do
       with {:ok, size} <- image_size(path),
            :ok <- check_image_size(path, size),
            {:ok, data} <- File.read(path) do
-        {:ok,
-         {:parts,
-          [
-            ToolResult.image_part(data, media_type),
-            ToolResult.text_part(describe_image(path, media_type, size))
-          ]}}
+        if valid_image_data?(data, media_type) do
+          {:ok,
+           {:parts,
+            [
+              ToolResult.image_part(data, media_type),
+              ToolResult.text_part(describe_image(path, media_type, size))
+            ]}}
+        else
+          {:ok, describe_invalid_image(path, media_type, size)}
+        end
       else
         {:error, :enoent} ->
           {:error, "file not found: #{path}"}
@@ -138,6 +181,11 @@ defmodule PurpleChonkyWhale.Tools.Read do
   end
 
   defp check_image_size(_path, _size), do: :ok
+
+  defp describe_invalid_image(path, media_type, size) do
+    describe_image(path, media_type, size) <>
+      " (corrupt or truncated: not a complete #{media_type} image, so only this description is shown)"
+  end
 
   defp describe_image(path, media_type, size \\ nil) do
     size_note =

@@ -49,7 +49,7 @@ defmodule Noctilucent.CLITest do
   describe "build_prompt/3" do
     @moduletag :tmp_dir
 
-    @png <<137, 80, 78, 71, 13, 10, 26, 10, 7, 7>>
+    @png <<137, 80, 78, 71, 13, 10, 26, 10, 7, 7, 0, 0, 0, 0, "IEND", 0xAE, 0x42, 0x60, 0x82>>
 
     test "@image tokens attach image parts; the text keeps the token", %{tmp_dir: dir} do
       File.write!(Path.join(dir, "pic.png"), @png)
@@ -59,6 +59,15 @@ defmodule Noctilucent.CLITest do
       assert text == "look at @pic.png please"
       assert %{"type" => "image", "data" => @png, "mediaType" => "image/png"} = part
       assert notice =~ "attached @pic.png"
+    end
+
+    test "corrupt or truncated images are skipped with a notice", %{tmp_dir: dir} do
+      # PNG signature plus junk, no IEND chunk — like a truncated write.
+      File.write!(Path.join(dir, "stub.png"), <<137, 80, 78, 71, 13, 10, 26, 10, 7, 7>>)
+
+      assert {_, [], [notice]} = CLI.build_prompt("see @stub.png", dir)
+      assert notice =~ "skipped @stub.png"
+      assert notice =~ "corrupt or truncated"
     end
 
     test "trailing punctuation after a token is not part of the path", %{tmp_dir: dir} do
