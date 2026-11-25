@@ -31,9 +31,14 @@ defmodule PurpleChonkyWhale.Sessions do
   @doc """
   Open the session `id`, starting its log process (replaying the on-disk
   log, if any) or returning the already-open one.
+
+  Options are passed to `PurpleChonkyWhale.Session.start_link/1` and only
+  matter when the log is created: `:cwd` records the working directory the
+  session was opened for in the physical header (defaults to the store
+  process's cwd). Reopening an existing log ignores them.
   """
-  @spec open(t(), Session.id()) :: {:ok, pid()}
-  def open(%__MODULE__{} = sessions, id) do
+  @spec open(t(), Session.id(), keyword()) :: {:ok, pid()}
+  def open(%__MODULE__{} = sessions, id, opts \\ []) do
     # DynamicSupervisor does not dedupe children by spec id; the via-name
     # registration does (a second open returns :already_started).
     spec = %{
@@ -46,7 +51,7 @@ defmodule PurpleChonkyWhale.Sessions do
              dir: sessions.dir,
              scope: sessions.scope,
              name: {:via, Registry, {sessions.registry, id}}
-           ]
+           ] ++ Keyword.take(opts, [:cwd])
          ]},
       restart: :transient
     }

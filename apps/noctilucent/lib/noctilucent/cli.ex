@@ -53,7 +53,8 @@ defmodule Noctilucent.CLI do
     {"/reset", "start a fresh session log (the old one stays on disk)"},
     {"/sessions", "list saved session ids"},
     {"/resume ID", "switch to (or open) session ID"},
-    {"/log", "print the model-visible message count"}
+    {"/log", "print the model-visible message count"},
+    {"/help", "show the commands and options"}
   ]
 
   ## Entry
@@ -114,12 +115,13 @@ defmodule Noctilucent.CLI do
     end
   end
 
-  defp usage do
-    commands =
-      Enum.map_join(@commands, "\n", fn {cmd, doc} ->
-        "  #{String.pad_trailing(cmd, 14)} #{doc}"
-      end)
+  defp commands_help do
+    Enum.map_join(@commands, "\n", fn {cmd, doc} ->
+      "  #{String.pad_trailing(cmd, 14)} #{doc}"
+    end)
+  end
 
+  defp usage do
     """
     usage: mix noctilucent [options]
 
@@ -133,7 +135,7 @@ defmodule Noctilucent.CLI do
       --help, -h           show this help
 
     Commands while chatting:
-    #{commands}
+    #{commands_help()}
     """
   end
 
@@ -174,13 +176,13 @@ defmodule Noctilucent.CLI do
     system = Presets.system_prompt(config.persona, cwd: cwd) <> skill_section(tools)
 
     {session_id, session} =
-      open_session(sessions, config.session || fresh_id(config.persona), system, memory)
+      open_session(sessions, config.session || fresh_id(config.persona), system, memory, cwd)
 
     IO.puts([
       "persona: #{config.persona}\n",
       "session: #{session_id}\n",
       "cwd: #{cwd}\n",
-      "type /quit to leave; /cancel to stop a run; /steer TEXT to steer one\n",
+      "type /quit to leave; /help for commands; /cancel to stop a run; /steer TEXT to steer one\n",
       "---"
     ])
 
@@ -282,8 +284,11 @@ defmodule Noctilucent.CLI do
   # recalled memory as a second system message — recalled memory is
   # model-visible, therefore it must be logged. Resumed sessions keep their
   # log untouched (their recall happened when they were created).
-  defp open_session(sessions, id, system, memory) do
-    {:ok, session} = Sessions.open(sessions, id)
+  defp open_session(sessions, id, system, memory, cwd) do
+    # `cwd` only lands in the header of a fresh log; it records the working
+    # directory the session was opened for, which is not necessarily the
+    # store process's own cwd (the CLI's `-c`).
+    {:ok, session} = Sessions.open(sessions, id, cwd: cwd)
     {:ok, _} = Session.seal_unsettled(session)
 
     if Session.events(session) == [] do
@@ -402,10 +407,20 @@ defmodule Noctilucent.CLI do
 
       {:line, "/reset", rest, eof?} ->
         {id, session} =
-          open_session(state.sessions, fresh_id(state.persona), state.system, state.memory)
+          open_session(
+            state.sessions,
+            fresh_id(state.persona),
+            state.system,
+            state.memory,
+            state.cwd
+          )
 
         IO.puts("[reset — switched to fresh session #{id}]")
         loop(%{state | session_id: id, session: session}, rest, eof?)
+
+      {:line, "/help", rest, eof?} ->
+        IO.puts("commands:\n" <> commands_help())
+        loop(state, rest, eof?)
 
       {:line, "/sessions", rest, eof?} ->
         ids = state.sessions |> Sessions.list() |> Enum.sort()
@@ -419,7 +434,9 @@ defmodule Noctilucent.CLI do
             loop(state, rest, eof?)
 
           target ->
-            {id, session} = open_session(state.sessions, target, state.system, state.memory)
+            {id, session} =
+              open_session(state.sessions, target, state.system, state.memory, state.cwd)
+
             count = length(Session.messages(session))
             IO.puts("[resumed session #{id} (#{count} model-visible messages)]")
             loop(%{state | session_id: id, session: session}, rest, eof?)

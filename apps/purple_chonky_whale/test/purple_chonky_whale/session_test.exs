@@ -586,6 +586,46 @@ defmodule PurpleChonkyWhale.SessionTest do
       {:ok, pid2} = Sessions.open(sessions, "chat-1")
       assert [%{type: :"user/message"}] = Session.events(pid2)
     end
+
+    test "open/3 records the caller's cwd in a fresh session header", %{ctx: ctx, dir: dir} do
+      {:ok, _fiber} = Context.use(ctx, Sessions, dir: dir)
+
+      sessions =
+        eventually(fn ->
+          case Context.get(ctx, :sessions) do
+            {:ok, sessions} -> sessions
+            :error -> nil
+          end
+        end)
+
+      {:ok, pid} = Sessions.open(sessions, "at-work", cwd: "d:/somewhere/else")
+      {:ok, _} = Session.append(pid, :"user/message", %{"content" => "hi"})
+
+      header =
+        dir
+        |> Path.join("session-at-work.jsonl")
+        |> File.stream!()
+        |> Enum.take(1)
+        |> hd()
+        |> Jason.decode!()
+
+      assert header["cwd"] == "d:/somewhere/else"
+
+      # Opening an existing log ignores the option: the header is history.
+      :ok = Sessions.close(sessions, pid)
+      {:ok, pid2} = Sessions.open(sessions, "at-work", cwd: "d:/elsewhere")
+      assert [%{type: :"user/message"}] = Session.events(pid2)
+
+      header =
+        dir
+        |> Path.join("session-at-work.jsonl")
+        |> File.stream!()
+        |> Enum.take(1)
+        |> hd()
+        |> Jason.decode!()
+
+      assert header["cwd"] == "d:/somewhere/else"
+    end
   end
 
   defp eventually(fun, attempts \\ 50)
