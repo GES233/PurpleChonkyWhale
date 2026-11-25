@@ -29,7 +29,7 @@ is given per entry, e.g. in `examples/agent.exs`.
 | --- | --- | --- | --- |
 | `:llm` | `PurpleChonkyWhale.LLM` (config `:model` required; other keys pass through to ReqLLM) | `%LLM.Client{}` | `llm/request` (waterfall), `llm/chunk`, `llm/usage` (emits) |
 | `:sessions` | `PurpleChonkyWhale.Sessions` (config `:dir` required) | `%Sessions{}` | `session/event` (emit, per append) |
-| `:tools` | `PurpleChonkyWhale.Tools` (config `:tools`, `:env`) | `%Tools{}` registry | `tools/pre-execute` (waterfall over `%{name:, arguments:, decision:}`), `tools/post-execute` (emit) |
+| `:tools` | `PurpleChonkyWhale.Tools` (config `:tools`, `:env`, `:mcp_servers`) | `%Tools{}` registry | `tools/pre-execute` (waterfall over `%{name:, arguments:, decision:}`), `tools/post-execute` (emit) |
 | `:memory` | `PurpleChonkyWhale.Memory` (config `:layers`) | `%Memory{}` | `memory/recall`, `memory/remember` (emits) |
 
 `PurpleChonkyWhale.AgentLoop.run/4` is the driver: it seals any tool calls left
@@ -101,7 +101,26 @@ temp file).
   become multi-part `content`; image parts project to `ContentPart.image/2`.
 - `Tools` — registry + guarded pipeline (`lookup/2`, `schemas/1`,
   `execute/3`); typed results `{:ok, _}` | `{:error, %{type:, message:}}` with
-  `:type ∈ {:unknown_tool, :denied, :crashed}`.
+  `:type ∈ {:unknown_tool, :denied, :crashed}`. With `:mcp_servers` configured
+  it also owns the MCP clients (supervisor + registry, lifetime bound to the
+  composition via `Context.track/2`, like `Sessions`) and merges their
+  generated tool modules into the registry; a static tool wins a name
+  collision (with a warning). The `%Tools{}` handle keeps the `%MCP{}` in its
+  `:mcp` field.
+- `MCP` — MCP servers as a tool source (internal, not a seam): connects to
+  each declared server via Anubis, lists its tools and `Module.create/3`s a
+  self-contained `Tool` module per tool, named `mcp_<server>_<tool>`
+  (non-`[a-zA-Z0-9_]` characters become `_`, runs collapse, collisions get a
+  hash suffix). Fail-open per server: a server that won't start or handshake
+  is dropped with a warning, and clients are `:temporary` children so a
+  crash-looper can't exhaust the supervisor and kill healthy siblings.
+  `call/4` maps MCP results onto the tool contract (text joined, images
+  base64-decoded into `{:parts, parts}`, errors → `{:error, %{type: :mcp}}`,
+  never raising). A composition with a streamable-HTTP server gets one Finch
+  pool supervised next to the clients (Anubis requires the caller to own the
+  pool); a transport naming its own `:finch_name` is used as given, stdio-only
+  compositions get none. `:backend` defaults to `Anubis.Client` and is faked
+  in tests, mirroring `LLM`'s `:backend`.
 - `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`.
 - `Tools.{Read, Write, Edit, Glob, Grep, Executor, TodoWrite, Skill, Recompile}` — the built-ins.
   `Read` returns image files (png/jpeg/gif/webp, ≤ 5 MB) as viewable image
@@ -187,3 +206,9 @@ temp file).
   `build`, `target`, …) plus `.gitignore`/`.ignore` rules and never follows
   symlinked dirs; override per call with `env[:search_ignore_dirs]` (`[]`
   disables all pruning and walks everything reachable).
+- MCP servers are external processes and fail open on purpose: a dead server
+  (e.g. the ableton server when Ableton Live is not running) logs a warning
+  and its tools are simply absent — never a composition failure. Don't add a
+  "strict" path without a config flag. `MCP.tool_modules/2` creates atoms
+  (`Module.create/3`), bounded by composition × server × tool — fine for
+  declared config, never call it on unbounded input.

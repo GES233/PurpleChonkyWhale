@@ -13,8 +13,11 @@ stays generic.
   `:memory` with persona-writable (`<home>/<persona>/memory`) → global
   read-only (`~/.agents/memory`) layers, and derives the `:tools` env's
   `vision?` from the model's LLMDB input modalities (unknown models fail
-  open). Persona isolation falls out of the composition: separate session
-  dirs, tool sets and scopes.
+  open). The `:mcp_servers` option passes MCP server declarations through to
+  the `:tools` entry (default `[]` — no external subprocess starts unless the
+  caller opts in; see `PurpleChonkyWhale.MCP` in the kernel). Persona
+  isolation falls out of the composition: separate session dirs, tool sets
+  and scopes.
 - `Noctilucent.CLI` — the terminal REPL (`mix noctilucent`, see
   `lib/mix/tasks/noctilucent.ex`). Multi-turn over one session log, slash
   commands `/quit` `/cancel` `/steer` `/reset` `/sessions` `/resume` `/log`,

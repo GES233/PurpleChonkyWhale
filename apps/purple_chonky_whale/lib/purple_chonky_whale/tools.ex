@@ -14,8 +14,19 @@ defmodule PurpleChonkyWhale.Tools do
     * `:tools` — the tool modules (each implementing `PurpleChonkyWhale.Tool`)
     * `:env` — the execution environment handed to every `execute/2`
       (e.g. `%{cwd: ...}`), defaults to `%{}`
+    * `:mcp_servers` — MCP server declarations (see
+      `PurpleChonkyWhale.MCP`), defaults to `[]` (no processes, no behaviour
+      change). Each server's tools are registered as ordinary tools named
+      `mcp_<server>_<tool>` and run through the very same pipeline below —
+      approval hooks on `tools/pre-execute` cover them. A name collision
+      with a static tool is won by the static tool (with a warning).
+    * `:mcp_backend` — internal; the client backend handed to
+      `PurpleChonkyWhale.MCP`, defaults to `Anubis.Client` and is swapped
+      for a fake in tests (mirroring `PurpleChonkyWhale.LLM`'s `:backend`)
 
   The provision is a `%Tools{}` handle; consumers `inject: [:tools]`.
+  Without `update/3`, a config change reconciles through a full rebuild,
+  which is also the correct semantics for the MCP connections (reconnect).
 
   ## The execution pipeline
 
@@ -37,12 +48,20 @@ defmodule PurpleChonkyWhale.Tools do
 
   use Dexterous.Component, provide: [:tools]
 
+  require Logger
+
   alias Dexterous.Context
+  alias PurpleChonkyWhale.MCP
 
   @typedoc "The tool registry handle, the value bound to the `:tools` coeffect."
-  @type t :: %__MODULE__{tools: %{String.t() => module()}, env: map(), scope: Context.scope()}
+  @type t :: %__MODULE__{
+          tools: %{String.t() => module()},
+          env: map(),
+          scope: Context.scope(),
+          mcp: MCP.t() | nil
+        }
 
-  defstruct [:tools, :env, :scope]
+  defstruct [:tools, :env, :scope, :mcp]
 
   @pre_event :"tools/pre-execute"
   @post_event :"tools/post-execute"
@@ -51,12 +70,48 @@ defmodule PurpleChonkyWhale.Tools do
 
   @impl true
   def apply(ctx, config) do
-    tools =
+    static_tools =
       Map.new(Keyword.get(config, :tools, []), fn module -> {module.schema().name, module} end)
+
+    {mcp_tools, mcp} = start_mcp(ctx, config)
+
+    collisions = Enum.filter(Map.keys(mcp_tools), &Map.has_key?(static_tools, &1))
+
+    if collisions != [] do
+      Logger.warning(
+        "MCP tools colliding with static tools are dropped: #{Enum.join(collisions, ", ")}"
+      )
+    end
+
+    tools = Map.merge(mcp_tools, static_tools)
 
     env = Keyword.get(config, :env, %{})
 
-    Context.set(ctx, :tools, %__MODULE__{tools: tools, env: env, scope: ctx.scope})
+    Context.set(ctx, :tools, %__MODULE__{tools: tools, env: env, scope: ctx.scope, mcp: mcp})
+  end
+
+  # No `:mcp_servers` (the default) means no processes and zero behaviour
+  # change. Otherwise the MCP clients are owned through Context.track/2
+  # disposers, not links, like Sessions' subprocesses: both trap exits, and
+  # a trapping process dies when its parent (the fiber's transient apply
+  # process) exits.
+  defp start_mcp(ctx, config) do
+    case Keyword.get(config, :mcp_servers, []) do
+      [] ->
+        {%{}, nil}
+
+      servers ->
+        backend = Keyword.get(config, :mcp_backend, Anubis.Client)
+        {:ok, mcp} = MCP.start_link(servers, backend: backend)
+        registry_pid = Process.whereis(mcp.registry)
+
+        Process.unlink(mcp.sup)
+        Process.unlink(registry_pid)
+        Context.track(ctx, mcp.sup)
+        Context.track(ctx, registry_pid)
+
+        {MCP.tool_modules(mcp, backend: backend), mcp}
+    end
   end
 
   ## Registry

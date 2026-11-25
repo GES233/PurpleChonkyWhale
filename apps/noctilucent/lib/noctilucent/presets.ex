@@ -26,6 +26,10 @@ defmodule Noctilucent.Presets do
       (default `File.cwd!()`)
     * `:llm_opts` — extra `:llm` entry config (e.g. `:temperature`,
       `:base_url`, `:api_key`), passed through
+    * `:mcp_servers` — MCP server declarations (see
+      `PurpleChonkyWhale.MCP`), passed through to the `:tools` entry config;
+      defaults to `[]`, so no MCP client (and no external subprocess) starts
+      unless the caller opts in
 
   The skill directory chain (earlier entries win name collisions) is:
   workspace (`<cwd>/.agents/skills`, `<cwd>/.claude/skills`, `<cwd>/skills`)
@@ -55,6 +59,7 @@ defmodule Noctilucent.Presets do
     cwd = Keyword.get(opts, :cwd, File.cwd!())
     model = Keyword.get(opts, :model, @default_model)
     llm_opts = Keyword.get(opts, :llm_opts, [])
+    mcp_servers = Keyword.get(opts, :mcp_servers, [])
 
     [
       %Entry{id: :llm, component: LLM, config: [model: model] ++ llm_opts},
@@ -68,7 +73,8 @@ defmodule Noctilucent.Presets do
         component: Tools,
         config: [
           tools: tools_for(persona),
-          env: %{cwd: cwd, skill_dirs: skill_dirs(home, persona, cwd), vision?: vision?(model)}
+          env: %{cwd: cwd, skill_dirs: skill_dirs(home, persona, cwd), vision?: vision?(model)},
+          mcp_servers: mcp_servers
         ]
       },
       %Entry{

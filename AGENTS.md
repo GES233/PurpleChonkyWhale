@@ -24,4 +24,5 @@ Umbrella-level rules:
 - Shared compile-time config (e.g. the codepagex whitelist) lives in the root
   `config/config.exs`; app-specific config goes under each app.
 - Dependencies are vendored at the root `deps/`; Dexterous apps come from a
-  sparse git checkout.
+  sparse git checkout. `anubis_mcp` (+ its hard dep `peri`) backs the MCP
+  client used by `PurpleChonkyWhale.MCP`.

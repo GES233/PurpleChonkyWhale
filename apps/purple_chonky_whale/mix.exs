@@ -35,6 +35,11 @@ defmodule PurpleChonkyWhale.MixProject do
       {:req_llm, "~> 1.6"},
       {:llm_db, ">= 2026.9.5"},
 
+      # MCP (Model Context Protocol) client
+      {:anubis_mcp, "~> 2.2"},
+      # HTTP pool for MCP's streamable HTTP transport
+      {:finch, "~> 0.24"},
+
       # Serialization
       {:jason, "~> 1.4"},
 
