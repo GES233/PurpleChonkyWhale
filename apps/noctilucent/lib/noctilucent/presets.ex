@@ -132,7 +132,7 @@ defmodule Noctilucent.Presets do
       Tools.TodoWrite,
       Tools.Skill,
       Tools.Recompile,
-      Tools.Memory,
+      Tools.MemorySave,
       Tools.MemoryUpdate,
       Tools.MemoryDelete
     ]
@@ -147,7 +147,7 @@ defmodule Noctilucent.Presets do
       Tools.Grep,
       Tools.TodoWrite,
       Tools.Skill,
-      Tools.Memory,
+      Tools.MemorySave,
       Tools.MemoryUpdate,
       Tools.MemoryDelete
     ]
@@ -159,7 +159,7 @@ defmodule Noctilucent.Presets do
       Tools.Glob,
       Tools.Grep,
       Tools.Skill,
-      Tools.Memory,
+      Tools.MemorySave,
       Tools.MemoryUpdate,
       Tools.MemoryDelete
     ]

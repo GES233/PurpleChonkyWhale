@@ -91,7 +91,7 @@ temp file).
   `system/message`; `remember/2` appends one dated line to the innermost
   writable layer (layers default to read-only); `update_many/2` rewrites
   matching lines atomically (all matches validated before writing),
-  `delete/2` removes matching lines. `Tools.Memory` (`memory_save`),
+  `delete/2` removes matching lines. `Tools.MemorySave` (`memory_save`),
   `Tools.MemoryUpdate` (`memory_update` — a batch list, so one call covers
   update-many) and `Tools.MemoryDelete` (`memory_delete`) reach the handle
   through the scope carried in the tools env.

@@ -32,7 +32,7 @@ defmodule PurpleChonkyWhale.Tools.MemoryDelete do
     if String.trim(match) == "" do
       {:error, "match must not be empty"}
     else
-      with {:ok, memory} <- Tools.Memory.fetch_memory(env),
+      with {:ok, memory} <- Tools.MemorySave.fetch_memory(env),
            {:ok, %{deleted: count}} <- Memory.delete(memory, match) do
         {:ok, "deleted #{count} memory #{n(count)}"}
       else

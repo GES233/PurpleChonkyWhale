@@ -1,4 +1,4 @@
-defmodule PurpleChonkyWhale.Tools.Memory do
+defmodule PurpleChonkyWhale.Tools.MemorySave do
   @moduledoc """
   The `memory_save` tool: append a durable note to the composition's memory.
 

@@ -46,7 +46,7 @@ defmodule Noctilucent.PresetsTest do
         |> Map.fetch!(:config)
         |> Keyword.fetch!(:tools)
 
-      assert Tools.Memory in tools
+      assert Tools.MemorySave in tools
       assert Tools.MemoryUpdate in tools
       assert Tools.MemoryDelete in tools
     end

@@ -42,7 +42,7 @@ defmodule PurpleChonkyWhale.Tools.MemoryUpdate do
   @impl true
   def execute(%{"updates" => updates}, env) when is_list(updates) and updates != [] do
     if Enum.all?(updates, &valid_update?/1) do
-      with {:ok, memory} <- Tools.Memory.fetch_memory(env),
+      with {:ok, memory} <- Tools.MemorySave.fetch_memory(env),
            {:ok, %{updated: count}} <- Memory.update_many(memory, updates) do
         {:ok, "updated #{count} memory #{n(count)}"}
       else

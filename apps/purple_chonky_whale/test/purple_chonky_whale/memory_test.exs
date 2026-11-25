@@ -99,7 +99,7 @@ defmodule PurpleChonkyWhale.MemoryTest do
     test "writes through the scope's :memory coeffect", %{ctx: ctx, scope: scope, dir: dir} do
       _memory = start_memory(ctx, [{:persona, Path.join(dir, "persona"), writable: true}])
 
-      registry = %Tools{tools: %{"memory_save" => Tools.Memory}, env: %{}, scope: scope}
+      registry = %Tools{tools: %{"memory_save" => Tools.MemorySave}, env: %{}, scope: scope}
 
       assert {:ok, output} =
                Tools.execute(registry, "memory_save", %{"content" => "tea > coffee"})
@@ -109,7 +109,7 @@ defmodule PurpleChonkyWhale.MemoryTest do
     end
 
     test "fails cleanly without a memory seam or with empty content", %{scope: scope} do
-      registry = %Tools{tools: %{"memory_save" => Tools.Memory}, env: %{}, scope: scope}
+      registry = %Tools{tools: %{"memory_save" => Tools.MemorySave}, env: %{}, scope: scope}
 
       assert {:error, %{message: message}} =
                Tools.execute(registry, "memory_save", %{"content" => "note"})
@@ -117,7 +117,7 @@ defmodule PurpleChonkyWhale.MemoryTest do
       assert message =~ "no memory layer configured"
 
       assert {:error, "content must not be empty"} =
-               Tools.Memory.execute(%{"content" => "  "}, %{})
+               Tools.MemorySave.execute(%{"content" => "  "}, %{})
     end
   end
 
@@ -180,7 +180,7 @@ defmodule PurpleChonkyWhale.MemoryTest do
 
       registry = %Tools{
         tools: %{
-          "memory_save" => Tools.Memory,
+          "memory_save" => Tools.MemorySave,
           "memory_update" => Tools.MemoryUpdate,
           "memory_delete" => Tools.MemoryDelete
         },
