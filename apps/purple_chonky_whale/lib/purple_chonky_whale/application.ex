@@ -8,6 +8,7 @@ defmodule PurpleChonkyWhale.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      PurpleChonkyWhale.AgentRun.Outcomes,
       {Registry, keys: :unique, name: PurpleChonkyWhale.AgentRunRegistry},
       {DynamicSupervisor, strategy: :one_for_one, name: PurpleChonkyWhale.AgentRunSupervisor}
     ]

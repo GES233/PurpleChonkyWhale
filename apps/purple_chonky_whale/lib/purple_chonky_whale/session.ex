@@ -44,10 +44,31 @@ defmodule PurpleChonkyWhale.Session do
   broadcast on the scope's event bus as `:"session/event"` with
   `%{session: id, event: event}`.
 
+  ## Opening a log
+
+  Replay is defensive, because the one thing an append-only log must not do is
+  become unopenable:
+
+    * a clean log replays verbatim;
+    * a torn *trailing* line — the half-written remainder of an append that a
+      crash interrupted — is dropped and the file truncated back to its last
+      complete line, so only the write that was in flight is lost;
+    * corruption anywhere else is moved aside to `<path>.corrupt-<ms>` and a
+      fresh log starts, with an error naming both paths. Nothing is deleted,
+      and the session — and the supervisor above it — stays alive instead of
+      dying on a file it can never read.
+
+  `:sync` (default `false`) makes every append fsync. Without it a machine
+  crash (power loss) can lose the most recent appends and tear the last line;
+  a process crash cannot do worse than that, because an append is a single
+  `File.write/3` call.
+
   Known gaps versus DSH's session log: no generation chain.
   """
 
   use GenServer
+
+  require Logger
 
   alias PurpleChonkyWhale.ToolResult
   alias Dexterous.Context
@@ -134,25 +155,34 @@ defmodule PurpleChonkyWhale.Session do
     File.mkdir_p!(dir)
     path = Path.join(dir, "session-#{id}.jsonl")
 
-    {header, events, format, persisted?} = read_back(path, id, opts)
-    {calls, settled, open_batch} = index_tool_calls(events)
+    case read_back(path, id, opts) do
+      {:ok, header, events, format, persisted?} ->
+        {calls, settled, open_batch} = index_tool_calls(events)
 
-    {:ok,
-     %{
-       id: id,
-       dir: dir,
-       path: path,
-       scope: scope,
-       header: header,
-       events_rev: Enum.reverse(events),
-       next_seq: length(events),
-       last_event_id: events |> List.last() |> then(&(&1 && &1.id)),
-       calls: calls,
-       settled: settled,
-       open_batch: open_batch,
-       format: format,
-       persisted?: persisted?
-     }}
+        {:ok,
+         %{
+           id: id,
+           dir: dir,
+           path: path,
+           scope: scope,
+           sync?: Keyword.get(opts, :sync, false),
+           header: header,
+           events_rev: Enum.reverse(events),
+           next_seq: length(events),
+           last_event_id: events |> List.last() |> then(&(&1 && &1.id)),
+           calls: calls,
+           settled: settled,
+           open_batch: open_batch,
+           format: format,
+           persisted?: persisted?
+         }}
+
+      {:error, reason} ->
+        # Never append to a log this process could not read: `{:stop, ...}`
+        # still exits the caller that linked to it, but a supervisor sees a
+        # typed `{:error, reason}` instead of a decode stacktrace.
+        {:stop, reason}
+    end
   end
 
   @impl true
@@ -592,25 +622,123 @@ defmodule PurpleChonkyWhale.Session do
 
   ## Persistence
 
+  # Opening a log never trusts it blindly. Three outcomes, in order of
+  # severity:
+  #
+  #   * a clean log replays exactly as before;
+  #   * a *torn trailing line* (a crash in the middle of an append leaves a
+  #     half-written last line) is dropped and the file truncated back to the
+  #     last complete line — the damage is bounded to the write that was in
+  #     flight, and everything before it survives;
+  #   * corruption anywhere else cannot be bounded that way: the file is
+  #     moved aside to `<path>.corrupt-<ms>` and a fresh log starts, with a
+  #     loud error naming both paths. Nothing is deleted, and the session
+  #     stays usable instead of bricking the whole composition — a session
+  #     that restarts onto a broken log used to take its supervisor (and with
+  #     it the composition) down.
   defp read_back(path, id, opts) do
-    lines = if File.exists?(path), do: path |> File.stream!() |> Enum.to_list(), else: []
+    case File.read(path) do
+      {:error, :enoent} -> {:ok, new_header(id, opts), [], :v1, false}
+      {:error, reason} -> {:error, {:session_unreadable, path, reason}}
+      {:ok, ""} -> {:ok, new_header(id, opts), [], :v1, false}
+      {:ok, binary} -> parse_log(path, binary, id, opts)
+    end
+  end
 
-    case lines do
-      [] ->
-        {new_header(id, opts), [], :v1, false}
+  defp parse_log(path, binary, id, opts) do
+    {lines, torn?} =
+      case String.split(binary, "\n") do
+        segments ->
+          case List.last(segments) do
+            # the file ends with a newline: every line is complete
+            "" -> {Enum.drop(segments, -1), false}
+            # no trailing newline: the last line is (probably) incomplete
+            _ -> {segments, true}
+          end
+      end
 
-      [first | rest] ->
-        case Jason.decode!(first) do
-          %{"type" => "session", "version" => @format_version} = header ->
-            {header, Enum.map(rest, &decode_current/1), :v1, true}
+    case decode_lines(lines, torn?) do
+      {:ok, decoded} ->
+        classify(decoded, id, opts)
 
-          %{"type" => "session", "version" => version} ->
-            raise ArgumentError, "unsupported session format version: #{inspect(version)}"
+      {:torn, kept, kept_count} ->
+        rewrite_prefix(path, Enum.take(lines, kept_count))
 
-          _legacy ->
-            {header, events} = decode_legacy([first | rest], id)
-            {header, events, :v0, true}
+        Logger.warning(
+          "session log #{path}: dropped a torn trailing line " <>
+            "(kept #{kept_count} complete #{if kept_count == 1, do: "line", else: "lines"})"
+        )
+
+        classify(kept, id, opts)
+
+      {:corrupt, line_no, message} ->
+        quarantine(path, line_no, message, id, opts)
+    end
+  end
+
+  defp decode_lines(lines, torn?), do: do_decode(lines, torn?, 0, [])
+
+  defp do_decode([], _torn?, _n, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp do_decode([line | rest], torn?, n, acc) do
+    case Jason.decode(line) do
+      {:ok, value} ->
+        do_decode(rest, torn?, n + 1, [value | acc])
+
+      {:error, %Jason.DecodeError{} = error} ->
+        # Only the very last line of a file without a trailing newline can be
+        # the write that was in flight; anything else is real corruption.
+        if torn? and rest == [] do
+          {:torn, Enum.reverse(acc), n}
+        else
+          {:corrupt, n + 1, Exception.message(error)}
         end
+    end
+  end
+
+  defp classify([], id, opts), do: {:ok, new_header(id, opts), [], :v1, false}
+
+  defp classify([first | rest] = decoded, id, _opts) do
+    cond do
+      is_map(first) and first["type"] == "session" and first["version"] == @format_version ->
+        {:ok, first, Enum.map(rest, &decode_current/1), :v1, true}
+
+      is_map(first) and first["type"] == "session" ->
+        {:error, {:unsupported_session_format, first["version"]}}
+
+      true ->
+        {header, events} = decode_legacy(decoded, id)
+        {:ok, header, events, :v0, true}
+    end
+  end
+
+  # Keep the bytes of the complete lines verbatim (the decoded maps are for
+  # memory; the file is rewritten from the raw lines that parsed).
+  defp rewrite_prefix(path, []), do: File.write!(path, "")
+
+  defp rewrite_prefix(path, lines) do
+    File.write!(path, Enum.join(lines, "\n") <> "\n")
+  end
+
+  defp quarantine(path, line_no, message, id, opts) do
+    target = "#{path}.corrupt-#{System.system_time(:millisecond)}"
+
+    case File.rename(path, target) do
+      :ok ->
+        Logger.error(
+          "session log #{path} is corrupt (line #{line_no}: #{message}); " <>
+            "moved it to #{target} and started a fresh log"
+        )
+
+        {:ok, new_header(id, opts), [], :v1, false}
+
+      {:error, reason} ->
+        Logger.error(
+          "session log #{path} is corrupt (line #{line_no}: #{message}) and " <>
+            "could not be moved aside (#{:file.format_error(reason)}); refusing to append to it"
+        )
+
+        {:error, {:corrupt_session_log, path, line_no}}
     end
   end
 
@@ -624,8 +752,8 @@ defmodule PurpleChonkyWhale.Session do
     }
   end
 
-  defp decode_legacy(lines, id) do
-    events = Enum.map(lines, &decode_legacy_event/1)
+  defp decode_legacy(decoded, id) do
+    events = Enum.map(decoded, &decode_legacy_event/1)
 
     header = %{
       "type" => "session",
@@ -638,9 +766,7 @@ defmodule PurpleChonkyWhale.Session do
     {header, events}
   end
 
-  defp decode_current(line) do
-    decoded = Jason.decode!(line)
-
+  defp decode_current(decoded) do
     %{
       seq: decoded["seq"],
       id: decoded["id"],
@@ -651,8 +777,7 @@ defmodule PurpleChonkyWhale.Session do
     }
   end
 
-  defp decode_legacy_event(line) do
-    decoded = Jason.decode!(line)
+  defp decode_legacy_event(decoded) do
     seq = decoded["seq"]
 
     %{
@@ -680,8 +805,14 @@ defmodule PurpleChonkyWhale.Session do
         _ -> event_line
       end
 
-    File.write!(state.path, contents, [:append])
+    # `:sync` costs an fsync per event; off by default because a torn last
+    # line is repaired on open anyway. Turn it on for a log whose recent tail
+    # must survive a machine crash, not just a process crash.
+    File.write!(state.path, contents, write_opts(state))
   end
+
+  defp write_opts(%{sync?: true}), do: [:append, :sync]
+  defp write_opts(_state), do: [:append]
 
   defp encode_event(:v1, event) do
     Jason.encode!(%{

@@ -8,6 +8,21 @@ defmodule PurpleChonkyWhale.AgentRun do
   run settles **at most once** with a single terminal event
   (`:"run/completed"`, `:"run/failed"`, or `:"run/cancelled"`).
 
+  ## Lifecycle
+
+  A run is a process only while it is working. Settling stops it: one live
+  GenServer, ETS table and registry entry per *finished* turn is a leak that
+  grows with the conversation, and the durable record of the outcome is the
+  session log's terminal event anyway.
+
+  To keep the handle usable, the terminal state is copied into
+  `PurpleChonkyWhale.AgentRun.Outcomes` before the process exits, so a pid (or
+  run id) held by a caller still answers `await/2`, `status/1`, `cancel/2`
+  and `run_id/1`; `steer/2` answers `{:error, %{type: :not_running}}` rather
+  than raising into the caller. A caller that waits **after** the outcome has
+  been evicted from the cache gets an `ArgumentError` naming the run — never a
+  stale answer.
+
   ## Cancellation
 
   `cancel/2` performs cooperative, resource-aware cancellation:
@@ -28,6 +43,7 @@ defmodule PurpleChonkyWhale.AgentRun do
   use GenServer
 
   alias PurpleChonkyWhale.{AgentLoop, AgentRunSupervisor, Session}
+  alias PurpleChonkyWhale.AgentRun.Outcomes
   alias Dexterous.Context
   alias ReqLLM.StreamResponse
 
@@ -80,7 +96,10 @@ defmodule PurpleChonkyWhale.AgentRun do
   @doc "Return the `run_id` of `run`."
   @spec run_id(run_ref()) :: String.t()
   def run_id(run) do
-    run |> resolve_pid!() |> GenServer.call(:run_id)
+    case call_run(run, :run_id) do
+      {:ok, run_id} -> run_id
+      {:gone, ref} -> cached!(ref).run_id
+    end
   end
 
   @doc "Query the current status and outcome of `run`."
@@ -91,16 +110,35 @@ defmodule PurpleChonkyWhale.AgentRun do
           outcome: term()
         }
   def status(run) do
-    run |> resolve_pid!() |> GenServer.call(:status)
+    case call_run(run, :status) do
+      {:ok, status} ->
+        status
+
+      {:gone, ref} ->
+        record = cached!(ref)
+
+        %{
+          run_id: record.run_id,
+          session_id: record.session_id,
+          status: record.status,
+          outcome: record.outcome
+        }
+    end
   end
 
   @doc """
   Await the terminal outcome of `run`. Returns `{:ok, final_text}`,
   `{:error, {:cancelled, reason}}`, or `{:error, reason}`.
+
+  Works after the run's process has stopped: the outcome is served from
+  `PurpleChonkyWhale.AgentRun.Outcomes` (see the moduledoc).
   """
   @spec await(run_ref(), timeout()) :: {:ok, String.t()} | {:error, term()}
   def await(run, timeout \\ :infinity) do
-    run |> resolve_pid!() |> GenServer.call(:await, timeout)
+    case call_run(run, :await, timeout) do
+      {:ok, outcome} -> outcome
+      {:gone, ref} -> cached!(ref).outcome
+    end
   end
 
   @doc """
@@ -109,17 +147,24 @@ defmodule PurpleChonkyWhale.AgentRun do
   """
   @spec cancel(run_ref(), term()) :: {:ok, status()}
   def cancel(run, reason \\ "cancelled by caller") do
-    run |> resolve_pid!() |> GenServer.call({:cancel, reason}, :infinity)
+    case call_run(run, {:cancel, reason}) do
+      {:ok, reply} -> reply
+      {:gone, ref} -> {:ok, cached!(ref).status}
+    end
   end
 
   @doc """
   Append a steering user message to the run's session. If a tool batch is
   currently open, `Session.messages/1` holds the message until all tool
-  results in the batch settle.
+  results in the batch settle. A finished run has nothing left to steer:
+  the answer is `{:error, %{type: :not_running}}`.
   """
   @spec steer(run_ref(), String.t()) :: {:ok, Session.event()} | {:error, term()}
   def steer(run, content) when is_binary(content) do
-    run |> resolve_pid!() |> GenServer.call({:steer, content})
+    case call_run(run, {:steer, content}) do
+      {:ok, reply} -> reply
+      {:gone, _ref} -> {:error, %{type: :not_running, message: "run is no longer running"}}
+    end
   end
 
   ## GenServer Callbacks
@@ -274,7 +319,9 @@ defmodule PurpleChonkyWhale.AgentRun do
   def handle_info({:worker_done, pid, result}, %{worker_pid: pid} = state) do
     if is_reference(state.worker_ref), do: Process.demonitor(state.worker_ref, [:flush])
     state = settle_from_worker_result(state, result)
-    {:noreply, state}
+    # The run is a process only while it works; the outcome is cached (see
+    # settle_once/4) and the log keeps the durable record.
+    {:stop, :normal, state}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{worker_ref: ref} = state) do
@@ -287,7 +334,7 @@ defmodule PurpleChonkyWhale.AgentRun do
           settle_once(state, :failed, {:error, {:worker_crashed, reason}}, reason)
       end
 
-    {:noreply, state}
+    {:stop, :normal, state}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{session_ref: ref} = state) do
@@ -449,6 +496,15 @@ defmodule PurpleChonkyWhale.AgentRun do
 
     Registry.unregister(state.registry, {:session, state.session_id})
 
+    # Before the process stops: a caller holding this pid (or the run id) must
+    # still be able to collect the outcome. See PurpleChonkyWhale.AgentRun.Outcomes.
+    Outcomes.put(state.run_id, %{
+      session_id: state.session_id,
+      pid: self(),
+      status: status,
+      outcome: outcome
+    })
+
     Enum.each(state.await_waiters, &GenServer.reply(&1, outcome))
     Enum.each(state.cancel_waiters, &GenServer.reply(&1, {:ok, status}))
 
@@ -504,12 +560,50 @@ defmodule PurpleChonkyWhale.AgentRun do
     Context.emit(ctx, event, payload)
   end
 
-  defp resolve_pid!(pid) when is_pid(pid), do: pid
+  # A run may stop between the caller's `start` and this call: the pid is
+  # dead, or the id is no longer registered. Both mean "ask the cache". A
+  # timeout (or any other exit) is still the caller's to see — only the
+  # exits that say "that process is gone" are translated.
+  defp call_run(run, request, timeout \\ :infinity) do
+    case resolve(run) do
+      {:pid, pid} ->
+        case call_alive(pid, request, timeout) do
+          {:ok, reply} -> {:ok, reply}
+          :gone -> {:gone, pid}
+        end
 
-  defp resolve_pid!(run_id) when is_binary(run_id) do
+      :gone ->
+        {:gone, run}
+    end
+  end
+
+  defp resolve(pid) when is_pid(pid), do: {:pid, pid}
+
+  defp resolve(run_id) when is_binary(run_id) do
     case AgentRunSupervisor.lookup(run_id) do
-      {:ok, pid} -> pid
-      :error -> raise ArgumentError, "unknown or terminated run_id: #{run_id}"
+      {:ok, pid} -> {:pid, pid}
+      :error -> :gone
+    end
+  end
+
+  defp call_alive(pid, request, timeout) do
+    {:ok, GenServer.call(pid, request, timeout)}
+  catch
+    :exit, {:noproc, _} -> :gone
+    :exit, {:normal, _} -> :gone
+    :exit, {:shutdown, _} -> :gone
+    :exit, {{:shutdown, _}, _} -> :gone
+    :exit, {:killed, _} -> :gone
+  end
+
+  defp cached!(ref) do
+    case Outcomes.fetch(ref) do
+      {:ok, record} ->
+        record
+
+      :error ->
+        raise ArgumentError,
+              "run #{inspect(ref)} is no longer running and its terminal outcome is not cached"
     end
   end
 end

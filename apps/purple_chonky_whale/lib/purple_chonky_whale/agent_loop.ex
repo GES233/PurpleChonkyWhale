@@ -55,6 +55,7 @@ defmodule PurpleChonkyWhale.AgentLoop do
       run_id: run_id,
       session_id: session_id,
       tracker: tracker,
+      tool_specs: [],
       tool_concurrency: Keyword.get(opts, :tool_concurrency, System.schedulers_online()),
       on_stream: Keyword.get(opts, :on_stream, fn _ -> :ok end),
       on_tool_start: Keyword.get(opts, :on_tool_start, fn _, _ -> :ok end),
@@ -65,7 +66,10 @@ defmodule PurpleChonkyWhale.AgentLoop do
     {:ok, _} = Session.append(session, :"turn/start", maybe_put_run_id(%{}, run_id))
 
     try do
-      steps(client, session, tools, max_steps, 0, loop_ctx)
+      # Built once per run, not once per step: the tool list never changes
+      # mid-turn, and rebuilding ReqLLM specs on every step is pure waste
+      # (a hundred steps × a dozen tools, plus whatever MCP merged in).
+      steps(client, session, tools, max_steps, 0, %{loop_ctx | tool_specs: tool_specs!(tools)})
     after
       # Best-effort bookkeeping: if the session died mid-turn, the original
       # error must not be masked by a failure to close the turn.
@@ -150,9 +154,8 @@ defmodule PurpleChonkyWhale.AgentLoop do
             maybe_put_run_id(%{"n" => n}, loop_ctx.run_id)
           )
 
-        with {:ok, tool_specs} <- tool_specs(tools),
-             {:ok, response} <-
-               Client.stream(client, Session.messages(session), tools: tool_specs),
+        with {:ok, response} <-
+               Client.stream(client, Session.messages(session), tools: loop_ctx.tool_specs),
              {:ok, classified} <- consume_stream(response, loop_ctx) do
           settle(classified, client, session, tools, max_steps, n, loop_ctx)
         end
@@ -508,15 +511,14 @@ defmodule PurpleChonkyWhale.AgentLoop do
   # the Tools pipeline), so a placeholder satisfies the validation.
   # ReqLLM.tool/1 raises on an invalid schema — a programming error, which
   # the run's `after` still closes the turn around.
-  defp tool_specs(tools) do
-    {:ok,
-     Enum.map(Tools.schemas(tools), fn schema ->
-       ReqLLM.tool(
-         name: schema.name,
-         description: schema.description,
-         parameter_schema: schema.parameters,
-         callback: fn _args -> nil end
-       )
-     end)}
+  defp tool_specs!(tools) do
+    Enum.map(Tools.schemas(tools), fn schema ->
+      ReqLLM.tool(
+        name: schema.name,
+        description: schema.description,
+        parameter_schema: schema.parameters,
+        callback: fn _args -> nil end
+      )
+    end)
   end
 end

@@ -177,7 +177,14 @@ defmodule Noctilucent.CLI do
     system = Presets.system_prompt(config.persona, cwd: cwd) <> skill_section(tools)
 
     {session_id, session} =
-      open_session(sessions, config.session || fresh_id(config.persona), system, memory, cwd)
+      case open_session(sessions, config.session || fresh_id(config.persona), system, memory, cwd) do
+        {:ok, opened} ->
+          opened
+
+        {:error, reason} ->
+          IO.puts(:stderr, "cannot open session: #{describe_open_error(reason)}")
+          System.halt(3)
+      end
 
     IO.puts([
       "persona: #{config.persona}\n",
@@ -297,30 +304,50 @@ defmodule Noctilucent.CLI do
   # recalled memory as a second system message — recalled memory is
   # model-visible, therefore it must be logged. Resumed sessions keep their
   # log untouched (their recall happened when they were created).
+  #
+  # A log that cannot be opened (an unsupported format, or a corrupt file
+  # that could not be moved aside) comes back as `{:error, reason}`: the REPL
+  # shows it instead of crashing — the session log is the one thing a long
+  # conversation cannot afford to take down.
   defp open_session(sessions, id, system, memory, cwd) do
     # `cwd` only lands in the header of a fresh log; it records the working
     # directory the session was opened for, which is not necessarily the
     # store process's own cwd (the CLI's `-c`).
-    {:ok, session} = Sessions.open(sessions, id, cwd: cwd)
-    {:ok, _} = Session.seal_unsettled(session)
+    with {:ok, session} <- Sessions.open(sessions, id, cwd: cwd) do
+      {:ok, _} = Session.seal_unsettled(session)
 
-    if Session.events(session) == [] do
-      {:ok, _} = Session.append(session, :"system/message", %{"content" => system})
+      if Session.events(session) == [] do
+        {:ok, _} = Session.append(session, :"system/message", %{"content" => system})
 
-      case Memory.recall(memory) do
-        "" ->
-          :ok
+        case Memory.recall(memory) do
+          "" ->
+            :ok
 
-        recalled ->
-          {:ok, _} =
-            Session.append(session, :"system/message", %{
-              "content" => "Recalled long-term memory:\n\n" <> recalled
-            })
+          recalled ->
+            {:ok, _} =
+              Session.append(session, :"system/message", %{
+                "content" => "Recalled long-term memory:\n\n" <> recalled
+              })
+        end
       end
-    end
 
-    {id, session}
+      {:ok, {id, session}}
+    end
   end
+
+  defp describe_open_error({:corrupt_session_log, path, line}) do
+    "session log #{path} is corrupt (line #{line}) and could not be moved aside"
+  end
+
+  defp describe_open_error({:unsupported_session_format, version}) do
+    "unsupported session log format version: #{inspect(version)}"
+  end
+
+  defp describe_open_error({:session_unreadable, path, reason}) do
+    "cannot read #{path}: #{:file.format_error(reason)}"
+  end
+
+  defp describe_open_error(other), do: inspect(other)
 
   ## Rendering (driven by seam events, not by the REPL)
 
@@ -419,17 +446,21 @@ defmodule Noctilucent.CLI do
         loop(state, rest, eof?)
 
       {:line, "/reset", rest, eof?} ->
-        {id, session} =
-          open_session(
-            state.sessions,
-            fresh_id(state.persona),
-            state.system,
-            state.memory,
-            state.cwd
-          )
+        case open_session(
+               state.sessions,
+               fresh_id(state.persona),
+               state.system,
+               state.memory,
+               state.cwd
+             ) do
+          {:ok, {id, session}} ->
+            IO.puts("[reset — switched to fresh session #{id}]")
+            loop(%{state | session_id: id, session: session}, rest, eof?)
 
-        IO.puts("[reset — switched to fresh session #{id}]")
-        loop(%{state | session_id: id, session: session}, rest, eof?)
+          {:error, reason} ->
+            IO.puts("[cannot reset: #{describe_open_error(reason)}]")
+            loop(state, rest, eof?)
+        end
 
       {:line, "/help", rest, eof?} ->
         IO.puts("commands:\n" <> commands_help())
@@ -447,12 +478,16 @@ defmodule Noctilucent.CLI do
             loop(state, rest, eof?)
 
           target ->
-            {id, session} =
-              open_session(state.sessions, target, state.system, state.memory, state.cwd)
+            case open_session(state.sessions, target, state.system, state.memory, state.cwd) do
+              {:ok, {id, session}} ->
+                count = length(Session.messages(session))
+                IO.puts("[resumed session #{id} (#{count} model-visible messages)]")
+                loop(%{state | session_id: id, session: session}, rest, eof?)
 
-            count = length(Session.messages(session))
-            IO.puts("[resumed session #{id} (#{count} model-visible messages)]")
-            loop(%{state | session_id: id, session: session}, rest, eof?)
+              {:error, reason} ->
+                IO.puts("[cannot open session #{target}: #{describe_open_error(reason)}]")
+                loop(state, rest, eof?)
+            end
         end
 
       {:line, "/log", rest, eof?} ->
@@ -522,8 +557,13 @@ defmodule Noctilucent.CLI do
             :ok
 
           text ->
-            {:ok, _} = AgentRun.steer(run_pid, text)
-            IO.puts("\n[steered into #{run_id}]")
+            case AgentRun.steer(run_pid, text) do
+              {:ok, _} ->
+                IO.puts("\n[steered into #{run_id}]")
+
+              {:error, _reason} ->
+                IO.puts("\n[#{run_id} has already finished — nothing to steer]")
+            end
         end
 
         await_run(run_pid, run_id, pending, eof?)

@@ -61,6 +61,43 @@ defmodule PurpleChonkyWhale.ToolsTest do
     assert :error = Tools.lookup(registry, "nope")
   end
 
+  test "schemas are name-sorted even when the registry outgrows a flatmap" do
+    # Past 32 entries an Erlang map stops being a flatmap, so `Map.values/1`
+    # returns hash order and the model-facing tool list (the request prefix a
+    # provider caches) would shuffle between calls. A composition that merges
+    # MCP tools crosses that line easily, so the order must not depend on it.
+    tools =
+      for i <- 1..40, into: %{} do
+        name = "toy_" <> String.pad_leading(Integer.to_string(i), 2, "0")
+        module = Module.concat(__MODULE__, :"Toy#{i}")
+
+        {:module, ^module, _, _} =
+          Module.create(
+            module,
+            quote do
+              def schema do
+                %{
+                  name: unquote(name),
+                  description: "toy tool",
+                  parameters: %{"type" => "object"}
+                }
+              end
+            end,
+            Macro.Env.location(__ENV__)
+          )
+
+        {name, module}
+      end
+
+    registry = %Tools{tools: tools, env: %{}, scope: :unused}
+
+    names = registry |> Tools.schemas() |> Enum.map(& &1.name)
+
+    assert length(names) == 40
+    assert names == Enum.sort(names)
+    assert names == Enum.sort(Map.keys(tools))
+  end
+
   test "execute runs the tool with the env and emits post-execute", %{
     ctx: ctx,
     registry: registry

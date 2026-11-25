@@ -122,10 +122,21 @@ defmodule PurpleChonkyWhale.Tools do
     %{registry | env: Map.merge(registry.env || %{}, Map.new(extra_env))}
   end
 
-  @doc "The registered tool schemas, in registration-independent name order."
+  @doc """
+  The registered tool schemas, sorted by name.
+
+  Sorted on purpose: the registry is a map, so `Map.values/1` order is
+  incidental (name order for a small map, hash order past 32 entries) and
+  changes as tools are added or MCP servers merge in. The model-facing tool
+  list is the prefix of the request, i.e. the part providers cache, so the
+  order has to be a property of the tools, not of the map's internals.
+  """
   @spec schemas(t()) :: [PurpleChonkyWhale.Tool.schema()]
   def schemas(%__MODULE__{} = registry) do
-    registry.tools |> Map.values() |> Enum.map(& &1.schema())
+    registry.tools
+    |> Map.values()
+    |> Enum.map(& &1.schema())
+    |> Enum.sort_by(& &1.name)
   end
 
   @doc "The tool module registered under `name`, or `:error`."

@@ -236,6 +236,73 @@ defmodule PurpleChonkyWhale.AgentRunTest do
     assert {:ok, "second run done"} = AgentRun.await(run2)
   end
 
+  test "a settled run stops, and its outcome stays readable through the handle", %{
+    scope: scope,
+    sessions: sessions,
+    tools: tools,
+    runs: runs
+  } do
+    {:ok, session} = Sessions.open(sessions, "s-leaf")
+
+    {:ok, script} = Agent.start_link(fn -> [{:text, "only run"}] end)
+    client = make_client(scope, fn _ -> script end)
+
+    {:ok, run, run_id} =
+      AgentRun.start(
+        supervisor: runs,
+        session: session,
+        client: client,
+        tools: tools,
+        prompt: "hello"
+      )
+
+    ref = Process.monitor(run)
+
+    assert {:ok, "only run"} = AgentRun.await(run)
+    assert_receive {:DOWN, ^ref, :process, ^run, :normal}, 1_000
+    refute Process.alive?(run)
+
+    # A finished run must not leave a process, an ETS table or a registry
+    # entry behind per turn; the handle still answers from the cached outcome.
+    assert {:ok, "only run"} = AgentRun.await(run)
+    assert AgentRun.run_id(run) == run_id
+
+    assert %{status: :completed, run_id: ^run_id, outcome: {:ok, "only run"}} =
+             AgentRun.status(run)
+
+    assert {:ok, :completed} = AgentRun.cancel(run, "late cancel")
+    assert {:error, %{type: :not_running}} = AgentRun.steer(run, "too late")
+
+    # The run-id handle resolves the same way once the registry entry is gone.
+    assert :error = AgentRunSupervisor.lookup(runs, run_id)
+    assert {:ok, "only run"} = AgentRun.await(run_id)
+  end
+
+  test "a settled run's cached outcome never outlives the process silently", %{
+    scope: scope,
+    sessions: sessions,
+    tools: tools,
+    runs: runs
+  } do
+    {:ok, session} = Sessions.open(sessions, "s-unknown")
+
+    {:ok, script} = Agent.start_link(fn -> [{:text, "done"}] end)
+
+    {:ok, run, _run_id} =
+      AgentRun.start(
+        supervisor: runs,
+        session: session,
+        client: make_client(scope, fn _ -> script end),
+        tools: tools,
+        prompt: "hello"
+      )
+
+    assert {:ok, "done"} = AgentRun.await(run)
+
+    # A run id that was never started is an error, not a fabricated answer.
+    assert_raise ArgumentError, fn -> AgentRun.await("run_never_started") end
+  end
+
   test "parallel runs on a shared scope retain isolated session_id, run_id, and tool_call_id across events",
        %{
          ctx: ctx,

@@ -11,6 +11,8 @@ defmodule PurpleChonkyWhale.Sessions do
   Config:
 
     * `:dir` (required) — where the per-session JSONL logs live
+    * `:sync` — default for every session's `:sync` option (see below);
+      `false` unless given
 
   The provision is a `%Sessions{}` handle; consumers `inject: [:sessions]`
   and `open/2` sessions by id. Sessions are plain processes supervised under
@@ -24,9 +26,15 @@ defmodule PurpleChonkyWhale.Sessions do
   alias Dexterous.Context
 
   @typedoc "The session store handle, the value bound to the `:sessions` coeffect."
-  @type t :: %__MODULE__{sup: pid(), registry: atom(), dir: Path.t(), scope: Context.scope()}
+  @type t :: %__MODULE__{
+          sup: pid(),
+          registry: atom(),
+          dir: Path.t(),
+          scope: Context.scope(),
+          sync: boolean()
+        }
 
-  defstruct [:sup, :registry, :dir, :scope]
+  defstruct [:sup, :registry, :dir, :scope, sync: false]
 
   @doc """
   Open the session `id`, starting its log process (replaying the on-disk
@@ -35,10 +43,19 @@ defmodule PurpleChonkyWhale.Sessions do
   Options are passed to `PurpleChonkyWhale.Session.start_link/1` and only
   matter when the log is created: `:cwd` records the working directory the
   session was opened for in the physical header (defaults to the store
-  process's cwd). Reopening an existing log ignores them.
+  process's cwd), and `:sync` turns fsync-per-append on for this log
+  (defaulting to the component's `:sync` config).
+
+  A log that cannot be opened is reported, never raised: `{:error, reason}`,
+  which callers are expected to show rather than crash on.
   """
-  @spec open(t(), Session.id(), keyword()) :: {:ok, pid()}
+  @spec open(t(), Session.id(), keyword()) :: {:ok, pid()} | {:error, term()}
   def open(%__MODULE__{} = sessions, id, opts \\ []) do
+    opts =
+      opts
+      |> Keyword.put_new(:sync, sessions.sync)
+      |> Keyword.take([:cwd, :sync])
+
     # DynamicSupervisor does not dedupe children by spec id; the via-name
     # registration does (a second open returns :already_started).
     spec = %{
@@ -51,7 +68,7 @@ defmodule PurpleChonkyWhale.Sessions do
              dir: sessions.dir,
              scope: sessions.scope,
              name: {:via, Registry, {sessions.registry, id}}
-           ] ++ Keyword.take(opts, [:cwd])
+           ] ++ opts
          ]},
       restart: :transient
     }
@@ -59,6 +76,7 @@ defmodule PurpleChonkyWhale.Sessions do
     case DynamicSupervisor.start_child(sessions.sup, spec) do
       {:ok, pid} -> {:ok, pid}
       {:error, {:already_started, pid}} -> {:ok, pid}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -102,7 +120,8 @@ defmodule PurpleChonkyWhale.Sessions do
       sup: sup,
       registry: registry,
       dir: dir,
-      scope: ctx.scope
+      scope: ctx.scope,
+      sync: Keyword.get(config, :sync, false)
     })
   end
 end

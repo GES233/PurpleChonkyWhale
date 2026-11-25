@@ -7,6 +7,7 @@ defmodule PurpleChonkyWhale.SessionTest do
   setup do
     scope = :"session_test_#{System.unique_integer([:positive])}"
     dir = Path.join(System.tmp_dir!(), "pcw-session-test-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
 
     on_exit(fn -> File.rm_rf(dir) end)
 
@@ -625,6 +626,90 @@ defmodule PurpleChonkyWhale.SessionTest do
         |> Jason.decode!()
 
       assert header["cwd"] == "d:/somewhere/else"
+    end
+  end
+
+  describe "opening a damaged log" do
+    test "drops a torn trailing line and keeps everything before it", %{dir: dir, scope: scope} do
+      path = Path.join(dir, "session-torn.jsonl")
+
+      header =
+        ~s({"type":"session","version":1,"id":"torn","created_at":0,"cwd":"."})
+
+      event =
+        ~s({"seq":0,"id":"evt_a","parent_id":null,"type":"user/message","at":0,"data":{"content":"before the crash"}})
+
+      # A crash in the middle of an append leaves exactly this: one complete
+      # event, then half of the next line and no trailing newline.
+      File.write!(path, header <> "\n" <> event <> "\n" <> ~s({"seq":1,"id":"evt_b","parent_))
+
+      pid = open_session(dir, scope, :torn)
+
+      assert [stored] = Session.events(pid)
+      assert stored.id == "evt_a"
+
+      # The file itself was repaired, not just the in-memory view.
+      lines = Enum.to_list(File.stream!(path))
+      assert length(lines) == 2
+      assert String.ends_with?(List.last(lines), "}\n")
+
+      # And the log keeps working: the next event continues the sequence.
+      {:ok, next} = Session.append(pid, :"user/message", %{"content" => "after"})
+      assert next.seq == 1
+      assert next.parent_id == "evt_a"
+    end
+
+    test "moves a corrupt log aside instead of refusing to open", %{dir: dir, scope: scope} do
+      path = Path.join(dir, "session-corrupt.jsonl")
+
+      header =
+        ~s({"type":"session","version":1,"id":"corrupt","created_at":0,"cwd":"."})
+
+      good =
+        ~s({"seq":0,"id":"evt_a","parent_id":null,"type":"user/message","at":0,"data":{"content":"first"}})
+
+      # Newline-terminated garbage in the middle: not a torn write, so it
+      # cannot be repaired by dropping the tail.
+      File.write!(path, header <> "\n" <> good <> "\n" <> "{not json}\n" <> good <> "\n")
+
+      pid = open_session(dir, scope, :corrupt)
+
+      # A usable, empty session — nothing is lost from disk.
+      assert Session.events(pid) == []
+
+      refute File.exists?(path)
+
+      [quarantined] =
+        dir
+        |> File.ls!()
+        |> Enum.filter(&String.starts_with?(&1, "session-corrupt.jsonl.corrupt-"))
+
+      assert File.read!(Path.join(dir, quarantined)) =~ "{not json}"
+    end
+
+    test "an unsupported format is a typed error, not a decode crash", %{dir: dir, scope: scope} do
+      path = Path.join(dir, "session-future.jsonl")
+      File.write!(path, ~s({"type":"session","version":99,"id":"future"}) <> "\n")
+
+      # A linked caller still sees the exit signal; what changes is the shape:
+      # a typed reason a supervisor (and `Sessions.open/3`) can report.
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {:unsupported_session_format, 99}} =
+               Session.start_link(id: :future, dir: dir, scope: scope)
+    end
+
+    test ":sync is honoured per log", %{dir: dir, scope: scope} do
+      {:ok, pid} = Session.start_link(id: :synced, dir: dir, scope: scope, sync: true)
+
+      {:ok, event} = Session.append(pid, :"user/message", %{"content" => "durable"})
+      assert event.seq == 0
+
+      [header_line, event_line] =
+        Enum.to_list(File.stream!(Path.join(dir, "session-synced.jsonl")))
+
+      assert Jason.decode!(header_line)["type"] == "session"
+      assert Jason.decode!(event_line)["id"] == event.id
     end
   end
 
