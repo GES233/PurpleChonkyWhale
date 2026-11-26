@@ -49,9 +49,14 @@ defmodule PurpleChonkyWhale.Tool do
   @callback schema() :: schema()
   @callback execute(args :: map(), env()) :: {:ok, term()} | {:error, term()}
 
+  alias PurpleChonkyWhale.Security.PathGuard
+
   @doc """
   Resolve a model-supplied path against the environment's `:cwd` (falling
   back to the process cwd). Absolute paths pass through unchanged.
+
+  Prefer `authorize_path/3` in tools so workspace boundaries, symlinks and the
+  write self-destruct floor are enforced.
   """
   @spec resolve_path(env(), String.t()) :: String.t()
   def resolve_path(env, path) when is_binary(path) do
@@ -60,5 +65,15 @@ defmodule PurpleChonkyWhale.Tool do
     else
       Path.join(env[:cwd] || File.cwd!(), path)
     end
+  end
+
+  @doc """
+  Resolve and authorize a model-supplied path for `:read` or `:write` via
+  `PurpleChonkyWhale.Security.PathGuard`.
+  """
+  @spec authorize_path(env() | keyword(), term(), PathGuard.access()) ::
+          {:ok, String.t()} | {:error, String.t()}
+  def authorize_path(env, path, access) when access in [:read, :write] do
+    PathGuard.authorize(env, path, access)
   end
 end

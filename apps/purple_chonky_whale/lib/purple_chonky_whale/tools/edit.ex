@@ -44,10 +44,8 @@ defmodule PurpleChonkyWhale.Tools.Edit do
   end
 
   @impl true
-  def execute(%{"file_path" => _, "old_string" => old, "new_string" => new} = args, env)
-      when is_binary(old) and is_binary(new) do
-    path = Tool.resolve_path(env, args["file_path"])
-
+  def execute(%{"file_path" => file_path, "old_string" => old, "new_string" => new}, env)
+      when is_binary(file_path) and is_binary(old) and is_binary(new) do
     cond do
       old == "" ->
         {:error, "old_string must not be empty"}
@@ -56,7 +54,8 @@ defmodule PurpleChonkyWhale.Tools.Edit do
         {:error, "old_string and new_string are identical"}
 
       true ->
-        with {:ok, raw} <- read(path),
+        with {:ok, path} <- Tool.authorize_path(env, file_path, :write),
+             {:ok, raw} <- read(path),
              {:ok, edited, note} <- replace_preserving(raw, old, new),
              :ok <- File.write(path, edited) do
           {:ok, "edited #{path}" <> note}

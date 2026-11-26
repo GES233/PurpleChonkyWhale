@@ -65,11 +65,11 @@ defmodule PurpleChonkyWhale.Tools.Read do
 
   @impl true
   def execute(args, env) do
-    path = Tool.resolve_path(env, args["file_path"])
-
-    case image_media_type(path) do
-      {:ok, media_type} -> read_image(path, media_type, env)
-      :error -> read_text(path, args)
+    with {:ok, path} <- Tool.authorize_path(env, args["file_path"], :read) do
+      case image_media_type(path) do
+        {:ok, media_type} -> read_image(path, media_type, env)
+        :error -> read_text(path, args)
+      end
     end
   end
 

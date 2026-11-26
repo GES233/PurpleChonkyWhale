@@ -11,9 +11,13 @@ defmodule PurpleChonkyWhale.Executor.Runtimes.PowerShell do
   `-NoProfile -NonInteractive -ExecutionPolicy Bypass -File` — not
   `-Command`, which would re-parse the code's quoting the way `cmd.exe` does
   (the shell runtime's batch-file trick is the same idea). The script starts
-  by pinning the console output encoding to UTF-8, so even Windows
-  PowerShell 5.1 emits what the runner's decoding pipeline expects, and it
-  carries a BOM because 5.1 reads a BOM-less `.ps1` in the system ANSI
+  in strict fail-fast mode (`$ErrorActionPreference = 'Stop'` and
+  `Set-StrictMode -Version Latest`) before pinning the console output
+  encoding to UTF-8: without `Stop`, a non-terminating error such as
+  assigning to the case-insensitive read-only `$HOME` automatic variable
+  leaves `$home` pointing at `%USERPROFILE%` and lets subsequent commands
+  execute against the user's home directory. The script also carries a BOM
+  because Windows PowerShell 5.1 reads a BOM-less `.ps1` in the system ANSI
   codepage rather than UTF-8.
 
   The `:powershell` environment overrides the selection: the program (name
@@ -51,9 +55,17 @@ defmodule PurpleChonkyWhale.Executor.Runtimes.PowerShell do
   # The script goes to the runner as content, with the `:script` atom where
   # its path belongs in the argument vector. The BOM comes first: without it
   # Windows PowerShell 5.1 decodes the file in the system ANSI codepage and
-  # any non-ASCII code arrives mangled.
+  # any non-ASCII code arrives mangled. Strict mode + Stop follow immediately
+  # so a failed assignment (e.g. `$home = ...`) halts the script before any
+  # destructive follow-up line can run against the stale value.
   defp script_plan(exe, base_args, code) do
-    body = "\uFEFF[Console]::OutputEncoding = [Text.Encoding]::UTF8\r\n" <> crlf(code) <> "\r\n"
+    preamble =
+      "\uFEFF" <>
+        "$ErrorActionPreference = 'Stop'\r\n" <>
+        "Set-StrictMode -Version Latest\r\n" <>
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8\r\n"
+
+    body = preamble <> crlf(code) <> "\r\n"
 
     %{
       exe: exe,

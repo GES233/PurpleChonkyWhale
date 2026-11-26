@@ -121,7 +121,13 @@ temp file).
   pool); a transport naming its own `:finch_name` is used as given, stdio-only
   compositions get none. `:backend` defaults to `Anubis.Client` and is faked
   in tests, mirroring `LLM`'s `:backend`.
-- `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`.
+- `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`
+  and `authorize_path/3`.
+- `Security.PathGuard` — kernel-level path boundary enforcement (`realpath`
+  with symlink-loop cap, segment-aware workspace root checks) and an
+  unconditional write self-destruct floor (filesystem roots, OS system dirs,
+  `System.user_home/0` & sensitive user/harness subdirs, `env[:protected_dirs]`).
+  Used by `Read`/`Write`/`Edit`/`Glob`/`Grep` and `Executor`'s `cwd`.
 - `Tools.{Read, Write, Edit, Glob, Grep, Executor, TodoWrite, Skill, Recompile}` — the built-ins.
   `Read` returns image files (png/jpeg/gif/webp, ≤ 5 MB) as viewable image
   parts, or a text description when the env's `vision?` is false or the bytes
@@ -135,11 +141,16 @@ temp file).
   glob compiler used by `glob`/`grep`; `TodoWrite` also emits `:"tools/todo"`.
 - `Executor.Runner` — port executor: merges stdout/stderr, treats a settled
   process as a result (`exit status N` appended), kills the whole tree on
-  timeout, caps output head+tail, normalizes EOL, transcodes OEM-codepage bytes.
+  timeout, caps output head+tail, normalizes EOL, transcodes OEM-codepage
+  bytes, filters host env to an allowlist (explicitly unsetting secrets via
+  `false`), and pins `TEMP`/`TMP`/`TMPDIR` to a per-run scratch dir.
 - `Executor.Runtimes.{Shell, PowerShell, Python, Elixir, ElixirSubprocess}` —
   each a `Executor.Runtime`; all but `Elixir` build plans (script content plus
   the `:script` placeholder) for `Runner`, while `Elixir` evaluates in-process
-  with a stand-in group leader capturing IO.
+  with a stand-in group leader capturing IO (disabled by default; opt in via
+  `env[:allowed_runtimes]`). `PowerShell` prepends `$ErrorActionPreference = 'Stop'`
+  and `Set-StrictMode -Version Latest`; POSIX `Shell` prepends `set -euo pipefail`
+  (or `set -eu` for plain `sh`/`dash`).
 
 ## Invariants to respect
 

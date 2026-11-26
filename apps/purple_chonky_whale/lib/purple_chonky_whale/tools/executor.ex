@@ -12,6 +12,11 @@ defmodule PurpleChonkyWhale.Tools.Executor do
     "elixir_subprocess" => PurpleChonkyWhale.Executor.Runtimes.ElixirSubprocess
   }
 
+  # In-process BEAM evaluation ("elixir") bypasses every subprocess boundary
+  # and cannot be rolled back; compositions must opt in explicitly via
+  # `env[:allowed_runtimes]`.
+  @default_allowed_runtimes ~w(shell powershell python elixir_subprocess)
+
   @moduledoc """
   The `execute` tool: run a piece of code in one of five runtimes, chosen
   by the `runtime` argument (default `shell`).
@@ -28,7 +33,8 @@ defmodule PurpleChonkyWhale.Tools.Executor do
     * `elixir` — the code evaluated in the agent's own BEAM, where it can
       see and touch the live system (a running session, a loaded module).
       Nothing is isolated and side effects cannot be rolled back; a timeout
-      kills the evaluation but cannot undo what it already did.
+      kills the evaluation but cannot undo what it already did. **Disabled by
+      default** — compositions must opt in via `env[:allowed_runtimes]`.
     * `elixir_subprocess` — the code as an `.exs` script through the
       `elixir` CLI, in a fresh VM: Elixir on the same isolated pipeline as
       the other runtimes.
@@ -59,6 +65,9 @@ defmodule PurpleChonkyWhale.Tools.Executor do
     * `:shell_timeout_ms` — default timeout; capped at #{@max_timeout_ms}
     * `:shell_env` — extra environment variables for a subprocess, e.g.
       `%{"MIX_ENV" => "test"}`
+    * `:allowed_runtimes` — list of runtime names enabled for this
+      composition; defaults to `#{inspect(@default_allowed_runtimes)}` (so
+      in-process `"elixir"` requires explicit opt-in)
     * `:max_output_bytes` — default output cap
 
   The `timeout_ms` and `max_output_bytes` arguments override the environment
@@ -127,7 +136,7 @@ defmodule PurpleChonkyWhale.Tools.Executor do
 
     with :ok <- validate(code),
          {:ok, cwd} <- working_dir(args, env),
-         {:ok, runtime} <- runtime(args) do
+         {:ok, runtime} <- runtime(args, env) do
       runtime.run(code, %{
         cwd: cwd,
         env: env,
@@ -157,22 +166,43 @@ defmodule PurpleChonkyWhale.Tools.Executor do
     end
   end
 
-  defp working_dir(args, env) do
-    dir =
-      case Map.get(args, "cwd") do
-        nil -> env[:cwd] || File.cwd!()
-        given -> Tool.resolve_path(env, given)
-      end
+  @doc "The runtime names enabled when `env[:allowed_runtimes]` is not set."
+  @spec default_allowed_runtimes() :: [String.t()]
+  def default_allowed_runtimes, do: @default_allowed_runtimes
 
-    if File.dir?(dir), do: {:ok, dir}, else: {:error, "not a directory: #{dir}"}
+  defp working_dir(args, env) do
+    with {:ok, dir} <- resolve_working_dir(args, env) do
+      if File.dir?(dir), do: {:ok, dir}, else: {:error, "not a directory: #{dir}"}
+    end
   end
 
-  defp runtime(args) do
+  defp resolve_working_dir(args, env) do
+    case Map.get(args, "cwd") do
+      nil -> {:ok, env[:cwd] || File.cwd!()}
+      given -> Tool.authorize_path(env, given, :read)
+    end
+  end
+
+  defp runtime(args, env) do
     name = Map.get(args, "runtime", "shell")
 
     case Map.fetch(@runtimes, name) do
-      {:ok, runtime} -> {:ok, runtime}
-      :error -> {:error, "unknown runtime: #{inspect(name)}"}
+      {:ok, runtime} ->
+        if name in allowed_runtimes(env) do
+          {:ok, runtime}
+        else
+          {:error, "runtime #{inspect(name)} is disabled in this environment"}
+        end
+
+      :error ->
+        {:error, "unknown runtime: #{inspect(name)}"}
+    end
+  end
+
+  defp allowed_runtimes(env) do
+    case Map.get(env, :allowed_runtimes) do
+      list when is_list(list) -> list
+      _other -> @default_allowed_runtimes
     end
   end
 

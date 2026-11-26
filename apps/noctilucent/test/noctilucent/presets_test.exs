@@ -164,4 +164,19 @@ defmodule Noctilucent.PresetsTest do
     # Models unknown to the catalog fail open; the provider is the final arbiter.
     assert vision?.("acme:not-in-the-catalog") == true
   end
+
+  test "the tools env carries protected_dirs and disables in-process elixir by default", %{
+    tmp_dir: tmp_dir
+  } do
+    env =
+      Presets.entries(:coding, home: tmp_dir, cwd: tmp_dir)
+      |> entry(:tools)
+      |> Map.fetch!(:config)
+      |> Keyword.fetch!(:env)
+
+    assert Path.expand(tmp_dir) in env.protected_dirs
+    assert "shell" in env.allowed_runtimes
+    assert "elixir_subprocess" in env.allowed_runtimes
+    refute "elixir" in env.allowed_runtimes
+  end
 end

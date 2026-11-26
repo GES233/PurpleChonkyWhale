@@ -2,6 +2,84 @@ defmodule PurpleChonkyWhale.Executor.Runner do
   # Defined ahead of the moduledoc, which reads them.
   @kill_grace_ms 200
 
+  # Host environment variables forwarded to child processes by default
+  # (matched case-insensitively because Windows env names vary in casing).
+  # Secrets such as *_API_KEY, *_TOKEN, AWS_* and arbitrary host vars are
+  # explicitly unset (`false` in Port.open's `:env` option) unless named in
+  # `env[:env_allowlist]` or `env[:shell_env]`.
+  @default_env_allowlist ~w[
+    PATH
+    PATHEXT
+    COMSPEC
+    SYSTEMROOT
+    WINDIR
+    SYSTEMDRIVE
+    OS
+    NUMBER_OF_PROCESSORS
+    PROCESSOR_ARCHITECTURE
+    PROCESSOR_IDENTIFIER
+    PROGRAMFILES
+    PROGRAMFILES(X86)
+    PROGRAMW6432
+    PROGRAMDATA
+    COMMONPROGRAMFILES
+    COMMONPROGRAMFILES(X86)
+    USERPROFILE
+    HOMEDRIVE
+    HOMEPATH
+    APPDATA
+    LOCALAPPDATA
+    USERNAME
+    USERDOMAIN
+    COMPUTERNAME
+    HOME
+    USER
+    LOGNAME
+    SHELL
+    TERM
+    LANG
+    LC_ALL
+    LC_CTYPE
+    TZ
+    XDG_CONFIG_HOME
+    XDG_CACHE_HOME
+    XDG_DATA_HOME
+    XDG_RUNTIME_DIR
+    NO_COLOR
+    CI
+    SSL_CERT_FILE
+    SSL_CERT_DIR
+    MIX_ENV
+    MIX_HOME
+    MIX_ARCHIVES
+    HEX_HOME
+    ERL_AFLAGS
+    ERL_FLAGS
+    ELIXIR_ERL_OPTIONS
+    REBAR_CACHE_DIR
+    PYTHONIOENCODING
+    PYTHONUTF8
+    VIRTUAL_ENV
+    CONDA_PREFIX
+    CONDA_DEFAULT_ENV
+    NODE_PATH
+    NVM_DIR
+    FNM_DIR
+    PNPM_HOME
+    NPM_CONFIG_CACHE
+    GOPATH
+    GOROOT
+    CARGO_HOME
+    RUSTUP_HOME
+    JAVA_HOME
+    SCOOP
+    SCOOP_GLOBAL
+    GIT_INSTALL_ROOT
+    MSYS
+    MSYS2_ARG_CONV_EXCL
+    MSYS_NO_PATHCONV
+  ]
+
   @moduledoc """
   The port executor: given a *plan* — what to spawn — run it as a local
   subprocess and collect its output.
@@ -56,7 +134,9 @@ defmodule PurpleChonkyWhale.Executor.Runner do
   Run a plan and collect its output.
 
   The context carries the working directory (`:cwd`), the tool environment
-  (`:env` — its `:shell_env` is spelled out to the child in full), the
+  (`:env` — only allowlisted host variables plus `:env_allowlist` and
+  `:shell_env` reach the child; every other parent variable is explicitly
+  unset, and `TEMP`/`TMP`/`TMPDIR` point to a fresh per-run directory), the
   `:timeout_ms` after which the process tree is killed, and the
   `:max_output_bytes` cap on the output.
   """
@@ -67,37 +147,61 @@ defmodule PurpleChonkyWhale.Executor.Runner do
           max_output_bytes: pos_integer()
         }) :: {:ok, String.t()} | {:error, String.t()}
   def run(plan, ctx) do
-    with {:ok, plan, script_dir} <- materialize(plan) do
+    with {:ok, plan, run_dir, tmp_dir} <- materialize(plan) do
       try do
-        exec(plan, ctx.cwd, ctx.env, ctx.timeout_ms, ctx.max_output_bytes, script_dir)
+        exec(plan, ctx.cwd, ctx.env, ctx.timeout_ms, ctx.max_output_bytes, run_dir, tmp_dir)
       after
-        if script_dir, do: File.rm_rf(script_dir)
+        File.rm_rf(run_dir)
       end
     end
   end
 
-  # Content to disk: the script lands in its own temporary directory, the
-  # `:script` atom in the argument vector becomes the file's full path, and
-  # a `cwd: :script` resolves to that directory. The directory is handed
-  # back so `run/2` can delete it once the run settles.
-  defp materialize(%{script: nil} = plan), do: {:ok, plan, nil}
+  @doc "The default host environment variable names forwarded to child processes."
+  @spec default_env_allowlist() :: [String.t()]
+  def default_env_allowlist, do: @default_env_allowlist
 
-  defp materialize(%{script: %{name: name, content: content}} = plan) do
-    dir = Path.join(System.tmp_dir!(), "pcw-run-#{System.unique_integer([:positive])}")
-    path = Path.join(dir, name)
+  # Every run gets its own scratch directory `run_dir` with a child `tmp/`
+  # wired to TEMP/TMP/TMPDIR so a script cleaning `$TEMP` cannot touch host
+  # temp files — or its own running script file sitting beside `tmp/`.
+  defp materialize(plan) do
+    run_dir = Path.join(System.tmp_dir!(), "pcw-run-#{System.unique_integer([:positive])}")
+    tmp_dir = Path.join(run_dir, "tmp")
 
-    with :ok <- File.mkdir_p(dir),
-         :ok <- File.write(path, content) do
-      args =
-        Enum.map(plan.args, fn
-          :script -> path
-          arg -> arg
-        end)
-
-      cwd = if plan.cwd == :script, do: dir, else: plan.cwd
-      {:ok, %{plan | args: args, cwd: cwd}, dir}
+    with :ok <- mkdir_p(tmp_dir),
+         {:ok, materialized_plan} <- write_script(plan, run_dir) do
+      {:ok, materialized_plan, run_dir, tmp_dir}
     else
-      {:error, reason} -> {:error, "cannot write #{path}: #{:file.format_error(reason)}"}
+      {:error, reason} ->
+        File.rm_rf(run_dir)
+        {:error, reason}
+    end
+  end
+
+  defp mkdir_p(dir) do
+    case File.mkdir_p(dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "cannot create temp dir #{dir}: #{:file.format_error(reason)}"}
+    end
+  end
+
+  defp write_script(%{script: nil} = plan, _run_dir), do: {:ok, plan}
+
+  defp write_script(%{script: %{name: name, content: content}} = plan, run_dir) do
+    path = Path.join(run_dir, name)
+
+    case File.write(path, content) do
+      :ok ->
+        args =
+          Enum.map(plan.args, fn
+            :script -> path
+            arg -> arg
+          end)
+
+        cwd = if plan.cwd == :script, do: run_dir, else: plan.cwd
+        {:ok, %{plan | args: args, cwd: cwd}}
+
+      {:error, reason} ->
+        {:error, "cannot write #{path}: #{:file.format_error(reason)}"}
     end
   end
 
@@ -115,13 +219,13 @@ defmodule PurpleChonkyWhale.Executor.Runner do
 
   ## The run
 
-  defp exec(plan, cwd, env, timeout_ms, max_bytes, script_dir) do
-    case open(plan, cwd, env) do
+  defp exec(plan, cwd, env, timeout_ms, max_bytes, run_dir, tmp_dir) do
+    case open(plan, cwd, env, tmp_dir) do
       {:ok, port, os_pid} ->
         old_trap = Process.flag(:trap_exit, true)
         settled_ref = make_ref()
         Process.put(settled_ref, false)
-        watcher = spawn_watcher(self(), port, os_pid, script_dir)
+        watcher = spawn_watcher(self(), port, os_pid, run_dir)
 
         try do
           collect(port, os_pid, settled_ref, fresh(), deadline(timeout_ms), timeout_ms, max_bytes)
@@ -141,7 +245,7 @@ defmodule PurpleChonkyWhale.Executor.Runner do
     end
   end
 
-  defp open(plan, cwd, env) do
+  defp open(plan, cwd, env, tmp_dir) do
     port =
       Port.open({:spawn_executable, plan.exe}, [
         :binary,
@@ -154,7 +258,7 @@ defmodule PurpleChonkyWhale.Executor.Runner do
         :hide,
         args: Enum.map(plan.args, &to_charlist/1),
         cd: to_charlist(plan.cwd || cwd),
-        env: child_env(env)
+        env: child_env(env, tmp_dir)
       ])
 
     # A port is linked to whoever opened it, and a crashing child must not
@@ -172,16 +276,61 @@ defmodule PurpleChonkyWhale.Executor.Runner do
     exception -> {:error, "cannot start #{plan.exe}: #{Exception.message(exception)}"}
   end
 
-  # The child gets the parent environment plus the composition's `:shell_env`,
-  # spelled out in full: whether the port option replaces the inherited
-  # environment or extends it is not worth depending on.
-  defp child_env(env) do
+  defp child_env(env, tmp_dir) do
+    build_child_env(System.get_env(), env, tmp_dir)
+  end
+
+  @doc false
+  # Exposed for unit tests to verify allowlist filtering, explicit unsetting
+  # (`false`), and per-run TEMP/TMP isolation without mutating process env.
+  def build_child_env(parent_env, env, tmp_dir) do
+    allow_set =
+      (@default_env_allowlist ++ extra_allowlist(env))
+      |> MapSet.new(&String.upcase/1)
+
+    native_tmp = native_path(tmp_dir)
+
+    overrides =
+      %{"TEMP" => native_tmp, "TMP" => native_tmp, "TMPDIR" => native_tmp}
+      |> Map.merge(
+        Map.new(Map.get(env, :shell_env, %{}), fn {k, v} -> {to_string(k), to_string(v)} end)
+      )
+
+    override_by_up =
+      Map.new(overrides, fn {k, v} -> {String.upcase(k), {k, v}} end)
+
+    # Port.open extends the parent environment rather than replacing it: every
+    # host variable outside the allowlist must be explicitly unset with `false`
+    # so API keys and tokens never leak into subprocesses.
+    unsets =
+      Enum.flat_map(parent_env, fn {key, _val} ->
+        up = String.upcase(key)
+
+        case Map.fetch(override_by_up, up) do
+          {:ok, {^key, _}} -> []
+          {:ok, _different_case} -> [{to_charlist(key), false}]
+          :error -> if MapSet.member?(allow_set, up), do: [], else: [{to_charlist(key), false}]
+        end
+      end)
+
+    sets =
+      Enum.map(overrides, fn {key, val} -> {to_charlist(key), to_charlist(val)} end)
+
+    unsets ++ sets
+  end
+
+  defp extra_allowlist(env) do
     env
-    |> Map.get(:shell_env, %{})
-    |> Enum.reduce(System.get_env(), fn {key, value}, acc ->
-      Map.put(acc, to_string(key), to_string(value))
-    end)
-    |> Enum.map(fn {key, value} -> {to_charlist(key), to_charlist(value)} end)
+    |> Map.get(:env_allowlist, [])
+    |> List.wrap()
+    |> Enum.map(&to_string/1)
+  end
+
+  defp native_path(path) do
+    case :os.type() do
+      {:win32, _} -> String.replace(path, "/", "\\")
+      _posix -> path
+    end
   end
 
   defp deadline(ms), do: System.monotonic_time(:millisecond) + ms

@@ -28,14 +28,26 @@ defmodule PurpleChonkyWhale.Tools.Write do
 
   @impl true
   def execute(args, env) do
-    path = Tool.resolve_path(env, args["file_path"])
     content = args["content"] || ""
 
-    with :ok <- File.mkdir_p(Path.dirname(path)),
-         :ok <- File.write(path, content) do
+    with {:ok, path} <- Tool.authorize_path(env, args["file_path"], :write),
+         :ok <- mkdir_p(Path.dirname(path)),
+         :ok <- write_file(path, content) do
       lines = content |> String.split("\n") |> length()
       {:ok, "wrote #{lines} lines to #{path}"}
-    else
+    end
+  end
+
+  defp mkdir_p(dir) do
+    case File.mkdir_p(dir) do
+      :ok -> :ok
+      {:error, reason} -> {:error, "cannot create directory #{dir}: #{:file.format_error(reason)}"}
+    end
+  end
+
+  defp write_file(path, content) do
+    case File.write(path, content) do
+      :ok -> :ok
       {:error, reason} -> {:error, "cannot write #{path}: #{:file.format_error(reason)}"}
     end
   end

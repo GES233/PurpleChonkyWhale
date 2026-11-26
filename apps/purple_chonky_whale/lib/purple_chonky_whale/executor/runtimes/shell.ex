@@ -4,9 +4,12 @@ defmodule PurpleChonkyWhale.Executor.Runtimes.Shell do
   `sh -c` where bash is absent, on POSIX; on Windows a `bash`/`sh` found on
   PATH, with `cmd.exe /c` as the last resort.
 
-  POSIX commands are given a closed stdin (`exec 0</dev/null`), so a command
-  that would read from a terminal gets EOF instead of hanging until the
-  timeout. On Windows a command containing a double quote is written to a
+  POSIX commands are given a closed stdin (`exec 0</dev/null`) and strict
+  fail-fast flags (`set -euo pipefail` on bash/zsh/ksh, `set -eu` on plain
+  POSIX `sh`/`dash`), so a command that reads from a terminal gets EOF and an
+  unset variable or failed step aborts instead of continuing into a
+  destructive follow-up command. On Windows a command containing a double
+  quote is written to a
   temporary `.cmd` file and run from there, because `cmd.exe` re-parses the
   raw command line rather than an argument vector — a quoted argument cannot
   survive one as itself, and every `git commit -m "..."` would arrive
@@ -42,6 +45,7 @@ defmodule PurpleChonkyWhale.Executor.Runtimes.Shell do
   alias PurpleChonkyWhale.Executor.Runner
 
   @posix_shells ~w(sh bash dash zsh ksh ash busybox)
+  @pipefail_shells ~w(bash zsh ksh)
 
   @impl true
   def run(code, ctx) do
@@ -143,14 +147,16 @@ defmodule PurpleChonkyWhale.Executor.Runtimes.Shell do
   end
 
   # A POSIX shell takes the command as an argument, verbatim: an argument
-  # vector carries any quoting it contains untouched, and the shell's stdin
-  # is redirected shut first.
+  # vector carries any quoting it contains untouched, stdin is redirected shut
+  # first, and strict mode aborts on unset variables or failed steps.
   defp invocation(exe, base_args, command, cwd) do
     cond do
       posix_shell?(exe) ->
+        strict = if shell_name(exe) in @pipefail_shells, do: "set -euo pipefail", else: "set -eu"
+
         plan = %{
           exe: exe,
-          args: base_args ++ ["exec 0</dev/null\n" <> command],
+          args: base_args ++ ["exec 0</dev/null\n#{strict}\n" <> command],
           cwd: nil,
           script: nil
         }

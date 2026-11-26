@@ -60,13 +60,8 @@ defmodule PurpleChonkyWhale.Tools.Grep do
 
   @impl true
   def execute(%{"pattern" => pattern} = args, env) when is_binary(pattern) do
-    base =
-      case Map.get(args, "path") do
-        nil -> cwd(env)
-        path -> Tool.resolve_path(env, path)
-      end
-
     with {:ok, regex} <- compile(pattern, Map.get(args, "options")),
+         {:ok, base} <- resolve_base(args, env),
          {:ok, files} <- target_files(base, env) do
       limit = positive(args["limit"], @default_limit)
       max_bytes = non_negative(args["max_file_bytes"], @default_max_file_bytes)
@@ -81,6 +76,13 @@ defmodule PurpleChonkyWhale.Tools.Grep do
   end
 
   def execute(_args, _env), do: {:error, "pattern is a required string"}
+
+  defp resolve_base(args, env) do
+    case Map.get(args, "path") do
+      nil -> {:ok, cwd(env)}
+      path -> Tool.authorize_path(env, path, :read)
+    end
+  end
 
   defp cwd(env), do: env[:cwd] || File.cwd!()
 

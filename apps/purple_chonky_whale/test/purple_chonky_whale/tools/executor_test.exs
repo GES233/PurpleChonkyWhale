@@ -280,16 +280,27 @@ defmodule PurpleChonkyWhale.Tools.ExecutorTest do
   end
 
   describe "in-process elixir runtime" do
-    test "renders the return value", %{env: env} do
+    test "is disabled by default unless opted in via :allowed_runtimes", %{env: env} do
+      assert {:error, message} =
+               Executor.execute(%{"runtime" => "elixir", "code" => "1 + 1"}, env)
+
+      assert message =~ "disabled"
+    end
+
+    test "renders the return value when opted in", %{env: env} do
+      env = Map.put(env, :allowed_runtimes, ~w(shell powershell python elixir_subprocess elixir))
       assert {:ok, "2"} = Executor.execute(%{"runtime" => "elixir", "code" => "1 + 1"}, env)
     end
 
     test "captures IO.puts output ahead of the return value", %{env: env} do
+      env = Map.put(env, :allowed_runtimes, ~w(elixir))
+
       assert {:ok, "hello\n:ok"} =
                Executor.execute(%{"runtime" => "elixir", "code" => ~s|IO.puts("hello")|}, env)
     end
 
     test "kills an evaluation that outlives its timeout", %{env: env} do
+      env = Map.put(env, :allowed_runtimes, ~w(elixir))
       started = System.monotonic_time(:millisecond)
 
       assert {:error, message} =
@@ -303,10 +314,126 @@ defmodule PurpleChonkyWhale.Tools.ExecutorTest do
     end
 
     test "a raised exception is an error, not a crash", %{env: env} do
+      env = Map.put(env, :allowed_runtimes, ~w(elixir))
+
       assert {:error, message} =
                Executor.execute(%{"runtime" => "elixir", "code" => ~s|raise "boom"|}, env)
 
       assert message =~ "boom"
+    end
+  end
+
+  describe "P0 hardening (strict mode, env allowlist, isolated temp, cwd boundary)" do
+    test "build_child_env unsets non-allowlisted secrets, preserves allowlisted vars, and pins isolated TEMP/TMP" do
+      parent = %{
+        "PATH" => "/usr/bin",
+        "DEEPSEEK_API_KEY" => "sk-secret",
+        "AWS_SECRET_ACCESS_KEY" => "aws-secret",
+        "CUSTOM_OPT_IN" => "allowed-val",
+        "TEMP" => "/host/tmp",
+        "Temp" => "/host/tmp-mixed"
+      }
+
+      spec =
+        Runner.build_child_env(
+          parent,
+          %{env_allowlist: ["CUSTOM_OPT_IN"], shell_env: %{"EXPLICIT_VAR" => "1"}},
+          "/isolated/run/tmp"
+        )
+
+      assert {~c"DEEPSEEK_API_KEY", false} in spec
+      assert {~c"AWS_SECRET_ACCESS_KEY", false} in spec
+      refute Enum.any?(spec, fn {k, v} -> k == ~c"PATH" and v == false end)
+      refute Enum.any?(spec, fn {k, v} -> k == ~c"CUSTOM_OPT_IN" and v == false end)
+      assert {~c"Temp", false} in spec
+      assert {~c"EXPLICIT_VAR", ~c"1"} in spec
+
+      expected_tmp =
+        case :os.type() do
+          {:win32, _} -> ~c"\\isolated\\run\\tmp"
+          _posix -> ~c"/isolated/run/tmp"
+        end
+
+      assert {~c"TEMP", expected_tmp} in spec
+      assert {~c"TMP", expected_tmp} in spec
+      assert {~c"TMPDIR", expected_tmp} in spec
+    end
+
+    test "refuses a cwd outside the workspace", %{env: env} do
+      outside = Path.dirname(env.cwd)
+
+      assert {:error, message} =
+               Executor.execute(%{"code" => "echo hi", "cwd" => outside}, env)
+
+      assert message =~ "path denied"
+    end
+
+    test "shell strict mode aborts on unset variable before reaching the next command", %{
+      env: env
+    } do
+      if sh = posix_shell() do
+        env = Map.put(env, :shell, {sh, ["-c"]})
+
+        assert {:ok, output} =
+                 Executor.execute(
+                   %{"code" => "echo \"$PCW_DEFINITELY_UNSET_VAR\"; echo SHOULD_NOT_RUN"},
+                   env
+                 )
+
+        refute output =~ "SHOULD_NOT_RUN"
+        assert output =~ "exit status"
+      end
+    end
+
+    test "powershell strict mode aborts on read-only $home assignment before running the next line",
+         %{env: env} do
+      if powershell() do
+        # Regression test for the real-world `$home = ...; Remove-Item $home` bug:
+        # assigning to read-only $HOME must terminate immediately under Stop mode.
+        code = """
+        $home = Join-Path $env:TEMP "pcw-check"
+        Write-Output "SHOULD_NOT_RUN:$home"
+        """
+
+        assert {:ok, output} =
+                 Executor.execute(%{"runtime" => "powershell", "code" => code}, env)
+
+        refute output =~ "SHOULD_NOT_RUN"
+        assert output =~ "exit status"
+      end
+    end
+
+    test "subprocesses receive an isolated TEMP directory inside pcw-run-*", %{env: env} do
+      cond do
+        powershell() ->
+          assert {:ok, output} =
+                   Executor.execute(
+                     %{"runtime" => "powershell", "code" => "Write-Output $env:TEMP"},
+                     env
+                   )
+
+          assert output =~ "pcw-run-"
+
+        python() ->
+          assert {:ok, output} =
+                   Executor.execute(
+                     %{"runtime" => "python", "code" => "import os; print(os.environ['TEMP'])"},
+                     env
+                   )
+
+          assert output =~ "pcw-run-"
+
+        sh = posix_shell() ->
+          env = Map.put(env, :shell, {sh, ["-c"]})
+
+          assert {:ok, output} =
+                   Executor.execute(%{"code" => "printf '%s' \"$TEMP\""}, env)
+
+          assert output =~ "pcw-run-"
+
+        true ->
+          :ok
+      end
     end
   end
 end

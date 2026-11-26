@@ -73,7 +73,13 @@ defmodule Noctilucent.Presets do
         component: Tools,
         config: [
           tools: tools_for(persona),
-          env: %{cwd: cwd, skill_dirs: skill_dirs(home, persona, cwd), vision?: vision?(model)},
+          env: %{
+            cwd: cwd,
+            skill_dirs: skill_dirs(home, persona, cwd),
+            vision?: vision?(model),
+            protected_dirs: protected_dirs(home),
+            allowed_runtimes: PurpleChonkyWhale.Tools.Executor.default_allowed_runtimes()
+          },
           mcp_servers: mcp_servers
         ]
       },
@@ -208,6 +214,13 @@ defmodule Noctilucent.Presets do
       end
 
     [persona_layer | global]
+  end
+
+  defp protected_dirs(home) do
+    case System.user_home() do
+      nil -> [home]
+      user_home -> Enum.uniq([home, Path.join(user_home, ".dsh")])
+    end
   end
 
   defp skill_dirs(home, persona, cwd) do
