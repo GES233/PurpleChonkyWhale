@@ -32,6 +32,8 @@ defmodule Noctilucent.Presets do
       unless the caller opts in
     * `:policy_opts` — extra config passed to `Noctilucent.Policy` (e.g.
       `:ask`, `:auto_allow`, `:lease_ttl_ms`, `:initial_leases`)
+    * `:sandbox_opts` — extra config passed to `PurpleChonkyWhale.Sandbox`
+      (e.g. `:backend`, `:mode`, `:network?`, `:backend_opts`)
 
   The skill directory chain (earlier entries win name collisions) is:
   workspace (`<cwd>/.agents/skills`, `<cwd>/.claude/skills`, `<cwd>/skills`)
@@ -39,7 +41,7 @@ defmodule Noctilucent.Presets do
   """
 
   alias Noctilucent.Policy
-  alias PurpleChonkyWhale.{LLM, Memory, Sessions, Tools}
+  alias PurpleChonkyWhale.{LLM, Memory, Sandbox, Sessions, Tools}
   alias DexterousLoader.Entry
 
   @type persona :: :coding | :personal | :tutor
@@ -53,8 +55,9 @@ defmodule Noctilucent.Presets do
   def personas, do: @personas
 
   @doc """
-  The five seam entries (`:llm`, `:sessions`, `:tools`, `:memory`, `:policy`)
-  composing `persona`. Raises `FunctionClauseError` for unknown personas.
+  The six seam entries (`:llm`, `:sessions`, `:sandbox`, `:tools`, `:memory`,
+  `:policy`) composing `persona`. Raises `FunctionClauseError` for unknown
+  personas.
   """
   @spec entries(persona(), keyword()) :: [Entry.t()]
   def entries(persona, opts \\ []) when persona in @personas do
@@ -64,7 +67,20 @@ defmodule Noctilucent.Presets do
     llm_opts = Keyword.get(opts, :llm_opts, [])
     mcp_servers = Keyword.get(opts, :mcp_servers, [])
     policy_opts = Keyword.get(opts, :policy_opts, [])
+    sandbox_opts = Keyword.get(opts, :sandbox_opts, [])
     protected = protected_dirs(home)
+
+    sandbox_config =
+      Keyword.merge(
+        [
+          backend: Sandbox.Host,
+          mode: if(persona == :tutor, do: :read_only, else: :workspace_write),
+          cwd: cwd,
+          network?: :on_grant,
+          fail_open?: false
+        ],
+        sandbox_opts
+      )
 
     [
       %Entry{id: :llm, component: LLM, config: [model: model] ++ llm_opts},
@@ -74,11 +90,18 @@ defmodule Noctilucent.Presets do
         config: [dir: Path.join([home, "sessions", Atom.to_string(persona)])]
       },
       %Entry{
+        id: :sandbox,
+        component: Sandbox,
+        config: sandbox_config
+      },
+      %Entry{
         id: :tools,
         component: Tools,
         config: [
           tools: tools_for(persona),
           require_grant?: true,
+          require_sandbox?: true,
+          sandbox: sandbox_config,
           env: %{
             cwd: cwd,
             skill_dirs: skill_dirs(home, persona, cwd),

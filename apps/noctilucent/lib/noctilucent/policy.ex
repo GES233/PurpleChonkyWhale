@@ -314,6 +314,9 @@ defmodule Noctilucent.Policy do
         Enum.reject(request_ctx.caps, &(&1 in [:unknown, :mcp]))
       end
 
+    network_requested? =
+      "network access or package installation" in request_ctx.lint.reasons
+
     request = %{
       tool: request_ctx.name,
       arguments: request_ctx.args,
@@ -321,6 +324,7 @@ defmodule Noctilucent.Policy do
       summary: summarize_call(request_ctx.name, request_ctx.args),
       warnings: request_ctx.lint.reasons,
       high_risk?: request_ctx.high_risk?,
+      network_requested?: network_requested?,
       leaseable_capabilities: leaseable,
       default_lease_ms: state.lease_ttl_ms,
       session_id: Map.get(call, :session_id),
@@ -354,6 +358,7 @@ defmodule Noctilucent.Policy do
           name: request_ctx.name,
           caps: request_ctx.caps,
           high_risk?: request_ctx.high_risk?,
+          network_requested?: network_requested?,
           leaseable: leaseable
         }
     }
@@ -387,6 +392,7 @@ defmodule Noctilucent.Policy do
       Grant.new(
         capabilities: active.caps,
         tools: [active.name],
+        network?: if(active.network_requested?, do: true, else: nil),
         source: :once,
         reason: "approved once by user"
       )

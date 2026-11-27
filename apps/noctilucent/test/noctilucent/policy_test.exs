@@ -215,6 +215,31 @@ defmodule Noctilucent.PolicyTest do
              Tools.execute(tools, "write", %{"file_path" => "x.txt", "content" => "x"})
   end
 
+  test "network-flagged execute approved :once sets network?: true on the one-shot Grant", %{
+    tmp_dir: dir
+  } do
+    test_pid = self()
+
+    ask = fn req ->
+      send(test_pid, {:asked_net, req.network_requested?})
+      :once
+    end
+
+    {ctx, _tools, policy} = mount_stack(dir, ask: ask)
+
+    call = %{
+      name: "execute",
+      arguments: %{"code" => "curl https://example.com"},
+      capabilities: [:exec]
+    }
+
+    assert {:allow, grant} = Policy.authorize(policy, call)
+    assert_received {:asked_net, true}
+    assert grant.network? == true
+
+    _ = ctx
+  end
+
   defp await_binding(ctx, key, attempts \\ 50)
   defp await_binding(_ctx, key, 0), do: raise("#{key} not bound")
 

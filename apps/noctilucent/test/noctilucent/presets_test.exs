@@ -4,19 +4,20 @@ defmodule Noctilucent.PresetsTest do
   @moduletag :tmp_dir
 
   alias Noctilucent.{Policy, Presets}
-  alias PurpleChonkyWhale.{LLM, Memory, Sessions, Tools}
+  alias PurpleChonkyWhale.{LLM, Memory, Sandbox, Sessions, Tools}
   alias Dexterous.Context
   alias DexterousLoader.Entry
 
   defp entry(entries, id), do: Enum.find(entries, &(&1.id == id))
 
-  test "every persona mounts the four seams plus policy", %{tmp_dir: tmp_dir} do
+  test "every persona mounts the four seams plus sandbox and policy", %{tmp_dir: tmp_dir} do
     for persona <- Presets.personas() do
       entries = Presets.entries(persona, home: tmp_dir, cwd: tmp_dir)
 
       assert [
                %Entry{id: :llm, component: LLM},
                %Entry{id: :sessions, component: Sessions},
+               %Entry{id: :sandbox, component: Sandbox},
                %Entry{id: :tools, component: Tools},
                %Entry{id: :memory, component: Memory},
                %Entry{id: :policy, component: Policy}
@@ -24,6 +25,13 @@ defmodule Noctilucent.PresetsTest do
 
       tools_config = entry(entries, :tools).config
       assert Keyword.fetch!(tools_config, :require_grant?) == true
+      assert Keyword.fetch!(tools_config, :require_sandbox?) == true
+
+      sandbox_config = entry(entries, :sandbox).config
+      expected_mode = if persona == :tutor, do: :read_only, else: :workspace_write
+      assert Keyword.fetch!(sandbox_config, :mode) == expected_mode
+      assert Keyword.fetch!(sandbox_config, :network?) == :on_grant
+      assert Keyword.fetch!(sandbox_config, :fail_open?) == false
     end
   end
 
@@ -38,6 +46,7 @@ defmodule Noctilucent.PresetsTest do
     entries = Presets.entries(:coding, home: Path.join(tmp_dir, "home"), cwd: cwd)
     {:ok, _loader} = DexterousLoader.start_link(ctx, entries)
 
+    _sandbox = await_binding(ctx, :sandbox)
     tools = await_binding(ctx, :tools)
     _policy = await_binding(ctx, :policy)
 

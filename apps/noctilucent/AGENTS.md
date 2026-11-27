@@ -9,16 +9,17 @@ stays generic.
 
 - `Noctilucent.Presets` — the persona presets: `coding` / `personal` / `tutor`
   compositions of model, session dir, tool set, skill directory chain and
-  system prompt (`entries/2` + `system_prompt/2`). Mounts `:memory` with
-  persona-writable (`<home>/<persona>/memory`) → global read-only
-  (`~/.agents/memory`) layers, sets `require_grant?: true` and
-  `protected_dirs`/`allowed_runtimes` on `:tools`, mounts `:policy`
-  (`Noctilucent.Policy`), and derives the `:tools` env's `vision?` from the
-  model's LLMDB input modalities (unknown models fail open). The
-  `:mcp_servers` option passes MCP server declarations through to the `:tools`
-  entry (default `[]`), and `:policy_opts` passes through to `:policy`. Persona
-  isolation falls out of the composition: separate session dirs, tool sets,
-  policy leases and scopes.
+  system prompt (`entries/2` + `system_prompt/2`). Mounts `:sandbox`
+  (`PurpleChonkyWhale.Sandbox`, `:workspace_write` for coding/personal and
+  `:read_only` for tutor, `network?: :on_grant`, `fail_open?: false`), mounts
+  `:memory` with persona-writable (`<home>/<persona>/memory`) → global
+  read-only (`~/.agents/memory`) layers, sets `require_grant?: true`,
+  `require_sandbox?: true`, `sandbox`, and `protected_dirs`/`allowed_runtimes`
+  on `:tools`, mounts `:policy` (`Noctilucent.Policy`), and derives the
+  `:tools` env's `vision?` from the model's LLMDB input modalities (unknown
+  models fail open). `:mcp_servers`, `:policy_opts`, and `:sandbox_opts` pass
+  through to their entries. Persona isolation falls out of the composition:
+  separate session dirs, tool sets, policy leases, sandbox configs and scopes.
 - `Noctilucent.Policy` / `Noctilucent.Policy.ShellLint` — application-level
   permission policy component (`provide: [:policy]`) hooked onto
   `tools/pre-execute`. `ShellLint` statically blocks catastrophic commands

@@ -101,6 +101,7 @@ end
 
 llm = await.(:llm)
 sessions = await.(:sessions)
+_sandbox = await.(:sandbox)
 tools = await.(:tools)
 _policy = await.(:policy)
 

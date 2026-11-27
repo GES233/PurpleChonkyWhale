@@ -178,6 +178,7 @@ defmodule Noctilucent.CLI do
 
     llm = await(ctx, :llm)
     sessions = await(ctx, :sessions)
+    sandbox = await(ctx, :sandbox)
     tools = await(ctx, :tools)
     memory = await(ctx, :memory)
     policy = await(ctx, :policy)
@@ -198,6 +199,7 @@ defmodule Noctilucent.CLI do
       "persona: #{config.persona}\n",
       "session: #{session_id}\n",
       "cwd: #{cwd}\n",
+      "sandbox: #{inspect(sandbox.backend)} (mode: #{sandbox.profile.mode}, network: #{sandbox.profile.network?})\n",
       "type /quit to leave; /help for commands; /cancel to stop a run; /steer TEXT to steer one\n",
       "---"
     ])
@@ -678,6 +680,13 @@ defmodule Noctilucent.CLI do
         list -> Enum.map(list, &"  ! warning: #{&1}")
       end
 
+    network_lines =
+      if Map.get(request, :network_requested?, false) do
+        ["  ! sandbox: one-shot network access will be enabled for this call"]
+      else
+        []
+      end
+
     options =
       case leaseable do
         [] ->
@@ -692,7 +701,7 @@ defmodule Noctilucent.CLI do
     ([
        "[approval required] #{Map.get(request, :summary, request[:tool])}",
        "  tool: #{request[:tool]}  capabilities: [#{caps}]"
-     ] ++ warning_lines ++ [options])
+     ] ++ warning_lines ++ network_lines ++ [options])
     |> Enum.join("\n")
   end
 
