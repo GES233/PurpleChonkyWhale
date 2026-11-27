@@ -1,6 +1,8 @@
 defmodule Noctilucent.CLITest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureIO
+
   alias Noctilucent.CLI
 
   test "defaults to the personal persona in the launch cwd" do
@@ -137,6 +139,90 @@ defmodule Noctilucent.CLITest do
       assert rendered =~ "[active leases (1)]"
       assert rendered =~ "fs_write"
       assert rendered =~ "user lease"
+    end
+  end
+
+  describe "terminal event loop" do
+    test "only an idle wait prints the input prompt" do
+      send(self(), {:stdin_line, "/quit"})
+
+      idle_output =
+        capture_io(fn ->
+          assert {:line, "/quit", [], false} = CLI.next_line([], false)
+        end)
+
+      assert idle_output == "\n> "
+
+      queued_output =
+        capture_io(fn ->
+          assert {:line, "/quit", [], false} = CLI.next_line(["/quit"], false)
+          assert :eof = CLI.next_line([], true)
+        end)
+
+      assert queued_output == ""
+    end
+
+    test "running renders chunks and tools before completion without another prompt" do
+      send(self(), {:render, {:llm_chunk, ReqLLM.StreamChunk.text("answer")}})
+
+      send(
+        self(),
+        {:render, {:tool_result, %{name: "read", result: {:ok, "ok"}, duration_ms: 3}}}
+      )
+
+      send(self(), {:run_finished, "run-1", {:ok, "answer"}})
+
+      output =
+        capture_io(fn ->
+          assert {[], false} = CLI.await_run(self(), "run-1", [], false)
+        end)
+
+      assert output ==
+               "answer\n[tool read] ok (3ms)\n\n== turn complete (run-1) ==\n"
+
+      refute output =~ "> "
+    end
+
+    test "running still queues an ordinary message for the next turn without prompting" do
+      send(self(), {:stdin_line, "next turn"})
+      send(self(), {:run_finished, "run-2", {:ok, "done"}})
+
+      output =
+        capture_io(fn ->
+          assert {["next turn"], false} = CLI.await_run(self(), "run-2", [], false)
+        end)
+
+      refute output =~ "> "
+      assert output =~ "== turn complete (run-2) =="
+    end
+
+    test "approval consumes render events without printing the ordinary input prompt" do
+      ref = make_ref()
+
+      request = %{
+        tool: "write",
+        summary: "write -> out.txt",
+        capabilities: [:fs_write],
+        warnings: [],
+        leaseable_capabilities: [:fs_write],
+        default_lease_ms: 900_000
+      }
+
+      send(self(), {:approval_request, ref, self(), request})
+      send(self(), {:render, {:llm_chunk, ReqLLM.StreamChunk.text("working")}})
+      send(self(), {:stdin_line, "n"})
+      send(self(), {:run_finished, "run-3", {:ok, "done"}})
+
+      output =
+        capture_io(fn ->
+          assert {[], false} = CLI.await_run(self(), "run-3", [], false)
+        end)
+
+      assert_received {:approval_reply, ^ref, :deny}
+      assert output =~ "[approval required] write -> out.txt"
+      assert output =~ "working"
+      assert output =~ "== turn complete (run-3) =="
+      refute output =~ "\n> "
     end
   end
 end

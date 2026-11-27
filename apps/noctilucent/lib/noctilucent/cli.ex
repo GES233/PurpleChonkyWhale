@@ -22,6 +22,12 @@ defmodule Noctilucent.CLI do
   Slash commands while chatting: `/quit` `/cancel` `/steer TEXT` `/reset`
   `/sessions` `/resume ID` `/log` `/grants` `/revoke`.
 
+  Terminal output is owned by the REPL process. The stdin reader only forwards
+  lines, and seam listeners only forward render events. The REPL prints an
+  input prompt only while idle, then handles those events itself while idle,
+  running, or waiting for approval. This keeps asynchronous output from racing
+  independently through prompts and approval questions.
+
   Attach images inline with `@path/to/image.png` (png/jpeg/gif/webp, ≤ 5 MB,
   resolved against the working directory); attachments are ignored with a
   notice when the model has no image input, and corrupt or truncated files
@@ -154,8 +160,8 @@ defmodule Noctilucent.CLI do
     end
 
     ctx = Dexterous.root()
-    subscribe_renderers(ctx)
     repl = self()
+    subscribe_renderers(ctx, repl)
 
     entries_opts =
       [
@@ -362,58 +368,82 @@ defmodule Noctilucent.CLI do
 
   ## Rendering (driven by seam events, not by the REPL)
 
-  defp subscribe_renderers(ctx) do
+  defp subscribe_renderers(ctx, repl) do
     {:ok, _} =
       Context.on(ctx, :"llm/chunk", fn chunk ->
-        case chunk.type do
-          :content -> IO.write(chunk.text)
-          :thinking -> IO.write(IO.ANSI.faint() <> chunk.text <> IO.ANSI.reset())
-          _ -> :ok
+        send(repl, {:render, {:llm_chunk, chunk}})
+      end)
+
+    {:ok, _} =
+      Context.on(ctx, :"tools/post-execute", fn event ->
+        send(repl, {:render, {:tool_result, event}})
+      end)
+
+    {:ok, _} =
+      Context.on(ctx, :"memory/remember", fn event ->
+        send(repl, {:render, {:memory_remember, event}})
+      end)
+
+    {:ok, _} =
+      Context.on(ctx, :"memory/update", fn event ->
+        send(repl, {:render, {:memory_update, event}})
+      end)
+
+    {:ok, _} =
+      Context.on(ctx, :"memory/delete", fn event ->
+        send(repl, {:render, {:memory_delete, event}})
+      end)
+
+    {:ok, _} =
+      Context.on(ctx, :"tools/todo", fn event ->
+        send(repl, {:render, {:todos, event}})
+      end)
+  end
+
+  defp render_event({:llm_chunk, chunk}) do
+    case chunk.type do
+      :content -> IO.write(chunk.text)
+      :thinking -> IO.write(IO.ANSI.faint() <> chunk.text <> IO.ANSI.reset())
+      _ -> :ok
+    end
+  end
+
+  defp render_event({:tool_result, %{name: name, result: result, duration_ms: ms}}) do
+    status =
+      case result do
+        {:ok, {:parts, parts}} -> "ok, parts: #{inspect(Enum.map(parts, & &1["type"]))}"
+        {:ok, _} -> "ok"
+        {:error, error} -> "error: #{inspect(error)}"
+      end
+
+    IO.puts("\n[tool #{name}] #{status} (#{ms}ms)")
+  end
+
+  defp render_event({:memory_remember, %{layer: layer}}) do
+    IO.puts("\n[memory → #{layer}]")
+  end
+
+  defp render_event({:memory_update, %{layer: layer, updated: count}}) do
+    IO.puts("\n[memory → #{layer}: #{count} updated]")
+  end
+
+  defp render_event({:memory_delete, %{layer: layer, deleted: count}}) do
+    IO.puts("\n[memory → #{layer}: #{count} deleted]")
+  end
+
+  defp render_event({:todos, %{todos: todos}}) do
+    IO.puts("\n[todos]")
+
+    Enum.each(todos, fn %{content: content, status: status} ->
+      marker =
+        case status do
+          "completed" -> IO.ANSI.green() <> "[x]" <> IO.ANSI.reset()
+          "in_progress" -> IO.ANSI.yellow() <> "[>]" <> IO.ANSI.reset()
+          _ -> IO.ANSI.faint() <> "[ ]" <> IO.ANSI.reset()
         end
-      end)
 
-    {:ok, _} =
-      Context.on(ctx, :"tools/post-execute", fn %{name: name, result: result, duration_ms: ms} ->
-        status =
-          case result do
-            {:ok, {:parts, parts}} -> "ok, parts: #{inspect(Enum.map(parts, & &1["type"]))}"
-            {:ok, _} -> "ok"
-            {:error, error} -> "error: #{inspect(error)}"
-          end
-
-        IO.puts("\n[tool #{name}] #{status} (#{ms}ms)")
-      end)
-
-    {:ok, _} =
-      Context.on(ctx, :"memory/remember", fn %{layer: layer} ->
-        IO.puts("\n[memory → #{layer}]")
-      end)
-
-    {:ok, _} =
-      Context.on(ctx, :"memory/update", fn %{layer: layer, updated: count} ->
-        IO.puts("\n[memory → #{layer}: #{count} updated]")
-      end)
-
-    {:ok, _} =
-      Context.on(ctx, :"memory/delete", fn %{layer: layer, deleted: count} ->
-        IO.puts("\n[memory → #{layer}: #{count} deleted]")
-      end)
-
-    {:ok, _} =
-      Context.on(ctx, :"tools/todo", fn %{todos: todos} ->
-        IO.puts("\n[todos]")
-
-        Enum.each(todos, fn %{content: content, status: status} ->
-          marker =
-            case status do
-              "completed" -> IO.ANSI.green() <> "[x]" <> IO.ANSI.reset()
-              "in_progress" -> IO.ANSI.yellow() <> "[>]" <> IO.ANSI.reset()
-              _ -> IO.ANSI.faint() <> "[ ]" <> IO.ANSI.reset()
-            end
-
-          IO.puts("  #{marker} #{content}")
-        end)
-      end)
+      IO.puts("  #{marker} #{content}")
+    end)
   end
 
   ## The REPL
@@ -424,7 +454,7 @@ defmodule Noctilucent.CLI do
 
     spawn_link(fn ->
       read = fn read ->
-        case IO.gets("\n> ") do
+        case IO.gets("") do
           :eof ->
             send(repl, :stdin_eof)
 
@@ -525,13 +555,26 @@ defmodule Noctilucent.CLI do
     end
   end
 
-  defp next_line([head | rest], eof?), do: {:line, head, rest, eof?}
-  defp next_line([], true), do: :eof
+  @doc false
+  def next_line([head | rest], eof?), do: {:line, head, rest, eof?}
+  def next_line([], true), do: :eof
 
-  defp next_line([], false) do
+  def next_line([], false) do
+    IO.write("\n> ")
+    await_idle_line()
+  end
+
+  defp await_idle_line do
     receive do
-      {:stdin_line, line} -> {:line, line, [], false}
-      :stdin_eof -> :eof
+      {:stdin_line, line} ->
+        {:line, line, [], false}
+
+      :stdin_eof ->
+        :eof
+
+      {:render, event} ->
+        render_event(event)
+        await_idle_line()
     end
   end
 
@@ -555,11 +598,16 @@ defmodule Noctilucent.CLI do
     await_run(run_pid, run_id, pending, eof?)
   end
 
-  defp await_run(run_pid, run_id, pending, eof?) do
+  @doc false
+  def await_run(run_pid, run_id, pending, eof?) do
     receive do
       {:run_finished, ^run_id, outcome} ->
         print_run_outcome(run_id, outcome)
         {Enum.reverse(pending), eof?}
+
+      {:render, event} ->
+        render_event(event)
+        await_run(run_pid, run_id, pending, eof?)
 
       {:approval_request, ref, requester, request} ->
         if eof? do
@@ -609,6 +657,10 @@ defmodule Noctilucent.CLI do
         send(requester, {:approval_reply, ref, :deny})
         print_run_outcome(run_id, outcome)
         {Enum.reverse(pending), eof?}
+
+      {:render, event} ->
+        render_event(event)
+        await_approval_reply(run_pid, run_id, ref, requester, request, pending, eof?)
 
       {:stdin_line, "/cancel"} ->
         send(requester, {:approval_reply, ref, :deny})
