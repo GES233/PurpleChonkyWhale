@@ -130,6 +130,9 @@ defmodule PurpleChonkyWhale.Executor.Runner do
           script: %{name: String.t(), content: binary()} | nil
         }
 
+  alias Dexterous.Context
+  alias PurpleChonkyWhale.Sandbox
+
   @doc """
   Run a plan and collect its output.
 
@@ -139,6 +142,11 @@ defmodule PurpleChonkyWhale.Executor.Runner do
   unset, and `TEMP`/`TMP`/`TMPDIR` point to a fresh per-run directory), the
   `:timeout_ms` after which the process tree is killed, and the
   `:max_output_bytes` cap on the output.
+
+  When `env[:sandbox]` (or `Context.get(scope, :sandbox)`) is present, the
+  materialized plan is wrapped through `PurpleChonkyWhale.Sandbox.wrap_plan/4`
+  before spawning. If `env[:require_sandbox?]` is `true` and no sandbox is
+  configured, execution fails closed.
   """
   @spec run(plan(), %{
           cwd: String.t(),
@@ -147,13 +155,55 @@ defmodule PurpleChonkyWhale.Executor.Runner do
           max_output_bytes: pos_integer()
         }) :: {:ok, String.t()} | {:error, String.t()}
   def run(plan, ctx) do
-    with {:ok, plan, run_dir, tmp_dir} <- materialize(plan) do
+    with {:ok, sandbox, env} <- resolve_sandbox(ctx.env),
+         {:ok, plan, run_dir, tmp_dir} <- materialize(plan) do
       try do
-        exec(plan, ctx.cwd, ctx.env, ctx.timeout_ms, ctx.max_output_bytes, run_dir, tmp_dir)
+        run_ctx = %{cwd: ctx.cwd, run_dir: run_dir, tmp_dir: tmp_dir}
+
+        with {:ok, wrapped_plan} <- maybe_wrap_plan(sandbox, plan, run_ctx, env) do
+          exec(wrapped_plan, ctx.cwd, env, ctx.timeout_ms, ctx.max_output_bytes, run_dir, tmp_dir)
+        end
       after
         File.rm_rf(run_dir)
       end
     end
+  end
+
+  defp resolve_sandbox(env) when is_map(env) do
+    sandbox =
+      case Map.get(env, :sandbox) do
+        %Sandbox{} = s ->
+          s
+
+        _other ->
+          case Map.get(env, :scope) do
+            nil ->
+              nil
+
+            scope ->
+              case Context.get(Context.new(scope), :sandbox) do
+                {:ok, %Sandbox{} = s} -> s
+                _ -> nil
+              end
+          end
+      end
+
+    cond do
+      is_struct(sandbox, Sandbox) ->
+        {:ok, sandbox, Map.put(env, :sandbox, sandbox)}
+
+      Map.get(env, :require_sandbox?, false) == true ->
+        {:error, "sandbox required but no :sandbox component is configured"}
+
+      true ->
+        {:ok, nil, env}
+    end
+  end
+
+  defp maybe_wrap_plan(nil, plan, _run_ctx, _env), do: {:ok, plan}
+
+  defp maybe_wrap_plan(%Sandbox{} = sandbox, plan, run_ctx, env) do
+    Sandbox.wrap_plan(sandbox, plan, run_ctx, env)
   end
 
   @doc "The default host environment variable names forwarded to child processes."
@@ -320,9 +370,13 @@ defmodule PurpleChonkyWhale.Executor.Runner do
   end
 
   defp extra_allowlist(env) do
-    env
-    |> Map.get(:env_allowlist, [])
-    |> List.wrap()
+    sandbox_allow =
+      case Map.get(env, :sandbox) do
+        %Sandbox{profile: %{env_allowlist: list}} when is_list(list) -> list
+        _ -> []
+      end
+
+    (List.wrap(Map.get(env, :env_allowlist, [])) ++ sandbox_allow)
     |> Enum.map(&to_string/1)
   end
 

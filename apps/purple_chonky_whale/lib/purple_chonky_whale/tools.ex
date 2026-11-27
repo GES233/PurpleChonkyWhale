@@ -18,6 +18,13 @@ defmodule PurpleChonkyWhale.Tools do
       `{:allow, %PurpleChonkyWhale.Security.Grant{}}` from `:"tools/pre-execute"`
       whose capabilities, tool scope and TTL cover the target tool; defaults to
       `false` for bare kernel compositions
+    * `:sandbox` — optional `%PurpleChonkyWhale.Sandbox{}` or sandbox config
+      keyword list used for stdio MCP server startup and propagated to
+      `Executor.Runner` (if omitted, `execute/4` also checks `:sandbox` in the
+      composition context)
+    * `:require_sandbox?` — when `true`, refuse stdio MCP servers and
+      `Executor.Runner` execution unless a `:sandbox` is available; defaults
+      to `false` for bare kernel compositions
     * `:mcp_servers` — MCP server declarations (see
       `PurpleChonkyWhale.MCP`), defaults to `[]` (no processes, no behaviour
       change). Each server's tools are registered as ordinary tools named
@@ -58,7 +65,7 @@ defmodule PurpleChonkyWhale.Tools do
   require Logger
 
   alias Dexterous.{Context, Store}
-  alias PurpleChonkyWhale.{MCP, Tool}
+  alias PurpleChonkyWhale.{MCP, Sandbox, Tool}
   alias PurpleChonkyWhale.Security.Grant
 
   @typedoc "The tool registry handle, the value bound to the `:tools` coeffect."
@@ -67,10 +74,12 @@ defmodule PurpleChonkyWhale.Tools do
           env: map(),
           scope: Context.scope(),
           mcp: MCP.t() | nil,
-          require_grant?: boolean()
+          sandbox: Sandbox.t() | nil,
+          require_grant?: boolean(),
+          require_sandbox?: boolean()
         }
 
-  defstruct [:tools, :env, :scope, :mcp, require_grant?: false]
+  defstruct [:tools, :env, :scope, :mcp, :sandbox, require_grant?: false, require_sandbox?: false]
 
   @pre_event :"tools/pre-execute"
   @post_event :"tools/post-execute"
@@ -82,7 +91,15 @@ defmodule PurpleChonkyWhale.Tools do
     static_tools =
       Map.new(Keyword.get(config, :tools, []), fn module -> {module.schema().name, module} end)
 
-    {mcp_tools, mcp} = start_mcp(ctx, config)
+    sandbox =
+      case Keyword.get(config, :sandbox) do
+        nil -> nil
+        cfg -> Sandbox.from_config(cfg, ctx.scope)
+      end
+
+    require_sandbox? = Keyword.get(config, :require_sandbox?, false) == true
+
+    {mcp_tools, mcp} = start_mcp(ctx, config, sandbox, require_sandbox?)
 
     collisions = Enum.filter(Map.keys(mcp_tools), &Map.has_key?(static_tools, &1))
 
@@ -102,7 +119,9 @@ defmodule PurpleChonkyWhale.Tools do
       env: env,
       scope: ctx.scope,
       mcp: mcp,
-      require_grant?: require_grant?
+      sandbox: sandbox,
+      require_grant?: require_grant?,
+      require_sandbox?: require_sandbox?
     })
   end
 
@@ -111,14 +130,21 @@ defmodule PurpleChonkyWhale.Tools do
   # disposers, not links, like Sessions' subprocesses: both trap exits, and
   # a trapping process dies when its parent (the fiber's transient apply
   # process) exits.
-  defp start_mcp(ctx, config) do
+  defp start_mcp(ctx, config, sandbox, require_sandbox?) do
     case Keyword.get(config, :mcp_servers, []) do
       [] ->
         {%{}, nil}
 
       servers ->
         backend = Keyword.get(config, :mcp_backend, Anubis.Client)
-        {:ok, mcp} = MCP.start_link(servers, backend: backend)
+
+        {:ok, mcp} =
+          MCP.start_link(servers,
+            backend: backend,
+            sandbox: sandbox,
+            require_sandbox?: require_sandbox?
+          )
+
         registry_pid = Process.whereis(mcp.registry)
 
         Process.unlink(mcp.sup)
@@ -197,10 +223,31 @@ defmodule PurpleChonkyWhale.Tools do
   end
 
   defp derive_env(%__MODULE__{} = registry, call_env) do
-    (registry.env || %{})
-    |> Map.put_new(:scope, registry.scope)
-    |> Map.merge(Map.new(call_env))
+    base =
+      (registry.env || %{})
+      |> Map.put_new(:scope, registry.scope)
+      |> maybe_put_sandbox(registry)
+      |> maybe_put_require_sandbox(registry)
+
+    Map.merge(base, Map.new(call_env))
   end
+
+  defp maybe_put_sandbox(env, %__MODULE__{sandbox: %Sandbox{} = sandbox}) do
+    Map.put_new(env, :sandbox, sandbox)
+  end
+
+  defp maybe_put_sandbox(env, %__MODULE__{scope: scope}) do
+    case Context.get(Context.new(scope), :sandbox) do
+      {:ok, %Sandbox{} = sandbox} -> Map.put_new(env, :sandbox, sandbox)
+      _ -> env
+    end
+  end
+
+  defp maybe_put_require_sandbox(env, %__MODULE__{require_sandbox?: true}) do
+    Map.put_new(env, :require_sandbox?, true)
+  end
+
+  defp maybe_put_require_sandbox(env, _registry), do: env
 
   defp run_pre_execute(ctx, call, require_grant?) do
     ref = make_ref()

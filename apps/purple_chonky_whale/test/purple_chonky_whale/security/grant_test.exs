@@ -76,4 +76,16 @@ defmodule PurpleChonkyWhale.Security.GrantTest do
     assert gated.writable_roots == ["/allowed"]
     assert gated.grant == grant
   end
+
+  test "narrow/2 keeps network? strictly monotonic" do
+    allow_net = Grant.new(capabilities: [:exec], network?: true)
+    neutral = Grant.new(capabilities: [:exec])
+    deny_net = Grant.new(capabilities: [:exec], network?: false)
+
+    assert Grant.narrow(allow_net, allow_net).network? == true
+    assert Grant.narrow(allow_net, neutral).network? == nil
+    assert Grant.narrow(neutral, allow_net).network? == nil
+    assert Grant.narrow(allow_net, deny_net).network? == false
+    assert Grant.narrow(deny_net, allow_net).network? == false
+  end
 end

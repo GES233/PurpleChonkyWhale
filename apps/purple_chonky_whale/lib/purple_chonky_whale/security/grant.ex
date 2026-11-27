@@ -18,6 +18,7 @@ defmodule PurpleChonkyWhale.Security.Grant do
             writable_roots: nil,
             readable_roots: nil,
             allowed_runtimes: nil,
+            network?: nil,
             expires_at: nil,
             reason: nil,
             source: :policy
@@ -28,6 +29,7 @@ defmodule PurpleChonkyWhale.Security.Grant do
           writable_roots: [String.t()] | nil,
           readable_roots: [String.t()] | nil,
           allowed_runtimes: [String.t()] | nil,
+          network?: boolean() | nil,
           expires_at: integer() | nil,
           reason: String.t() | nil,
           source: atom()
@@ -47,6 +49,8 @@ defmodule PurpleChonkyWhale.Security.Grant do
       narrow `env[:readable_roots]`)
     * `:allowed_runtimes` — optional list of allowed `execute` runtimes (can
       only narrow `env[:allowed_runtimes]`)
+    * `:network?` — optional boolean (`true` requests network access when the
+      `:sandbox` profile allows `:on_grant`; `false` denies network access)
     * `:ttl_ms` — positive integer TTL relative to `now_ms` (converted to
       `:expires_at` unless `:expires_at` is given directly)
     * `:expires_at` — monotonic millisecond deadline (`System.monotonic_time(:millisecond)`)
@@ -82,6 +86,7 @@ defmodule PurpleChonkyWhale.Security.Grant do
       writable_roots: normalize_string_list(map[:writable_roots]),
       readable_roots: normalize_string_list(map[:readable_roots]),
       allowed_runtimes: normalize_string_list(map[:allowed_runtimes]),
+      network?: normalize_network(map[:network?]),
       expires_at: expires_at,
       reason: map[:reason],
       source: Map.get(map, :source, :policy)
@@ -131,6 +136,7 @@ defmodule PurpleChonkyWhale.Security.Grant do
       writable_roots: intersect_paths(a.writable_roots, b.writable_roots),
       readable_roots: intersect_paths(a.readable_roots, b.readable_roots),
       allowed_runtimes: intersect_lists(a.allowed_runtimes, b.allowed_runtimes),
+      network?: intersect_network(a.network?, b.network?),
       expires_at: min_deadline(a.expires_at, b.expires_at),
       reason: merge_reasons(a.reason, b.reason),
       source: if(a.source == b.source, do: a.source, else: :narrowed)
@@ -211,4 +217,12 @@ defmodule PurpleChonkyWhale.Security.Grant do
   defp normalize_string_list(list) when is_list(list) do
     Enum.map(list, &to_string/1)
   end
+
+  defp normalize_network(val) when val in [true, false], do: val
+  defp normalize_network(_), do: nil
+
+  defp intersect_network(false, _), do: false
+  defp intersect_network(_, false), do: false
+  defp intersect_network(true, true), do: true
+  defp intersect_network(_, _), do: nil
 end

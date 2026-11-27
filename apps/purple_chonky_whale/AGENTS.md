@@ -29,8 +29,9 @@ is given per entry, e.g. in `examples/agent.exs`.
 | --- | --- | --- | --- |
 | `:llm` | `PurpleChonkyWhale.LLM` (config `:model` required; other keys pass through to ReqLLM) | `%LLM.Client{}` | `llm/request` (waterfall), `llm/chunk`, `llm/usage` (emits) |
 | `:sessions` | `PurpleChonkyWhale.Sessions` (config `:dir` required) | `%Sessions{}` | `session/event` (emit, per append) |
-| `:tools` | `PurpleChonkyWhale.Tools` (config `:tools`, `:env`, `:mcp_servers`) | `%Tools{}` registry | `tools/pre-execute` (waterfall over `%{name:, arguments:, decision:}`), `tools/post-execute` (emit) |
+| `:tools` | `PurpleChonkyWhale.Tools` (config `:tools`, `:env`, `:mcp_servers`, `:require_grant?`, `:require_sandbox?`, `:sandbox`) | `%Tools{}` registry | `tools/pre-execute` (monotonic waterfall over `%{name:, arguments:, capabilities:, decision:}`), `tools/post-execute` (emit) |
 | `:memory` | `PurpleChonkyWhale.Memory` (config `:layers`) | `%Memory{}` | `memory/recall`, `memory/remember` (emits) |
+| `:sandbox` | `PurpleChonkyWhale.Sandbox` (config `:backend`, `:mode`, `:cwd`, `:network?`, `:fail_open?`, `:backend_opts`) | `%Sandbox{}` | — |
 
 `PurpleChonkyWhale.AgentLoop.run/4` is the driver: it seals any tool calls left
 unsettled by an interrupted turn, logs `turn/start`, then loops over
@@ -130,8 +131,16 @@ temp file).
   plus `capabilities/1` (defaulting undeclared tools to `[:unknown]`),
   `resolve_path/2` and `authorize_path/3`.
 - `Security.Grant` — structured capability grant (`capabilities`, `tools`,
-  `writable_roots`, `readable_roots`, `allowed_runtimes`, `expires_at`) with
-  `allows?/4`, monotonic `narrow/2`, and `apply_to_env/2`.
+  `writable_roots`, `readable_roots`, `allowed_runtimes`, `network?`,
+  `expires_at`) with `allows?/4`, monotonic `narrow/2`, and `apply_to_env/2`.
+- `Sandbox` / `Sandbox.Profile` / `Sandbox.Backend` / `Sandbox.{Host, Docker}` —
+  the `:sandbox` seam (`provide: [:sandbox]`) bounding subprocess execution
+  for both `Executor.Runner` plans and `{:stdio, opts}` `MCP` servers.
+  `Profile` enforces monotonic narrowing of `mode`, `writable_roots`,
+  `readable_roots`, and `network?` (`false | true | :on_grant`), failing
+  closed (`fail_open?: false`) when the selected backend is unavailable.
+  `Host` is the runnable pass-through backend; `Docker` wraps plans and stdio
+  transports into `--network=none --cap-drop=ALL --read-only` containers.
 - `Security.PathGuard` — kernel-level path boundary enforcement (`realpath`
   with symlink-loop cap, segment-aware workspace root checks) and an
   unconditional write self-destruct floor (filesystem roots, OS system dirs,

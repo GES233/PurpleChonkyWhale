@@ -80,7 +80,7 @@ defmodule PurpleChonkyWhale.MCP do
   require Logger
 
   alias Anubis.MCP.Response
-  alias PurpleChonkyWhale.ToolResult
+  alias PurpleChonkyWhale.{Sandbox, ToolResult}
 
   @default_backend Anubis.Client
   @default_client_info %{"name" => "purple_chonky_whale"}
@@ -113,7 +113,9 @@ defmodule PurpleChonkyWhale.MCP do
 
   @doc """
   Start the clients for `servers` and return the handle with the flattened
-  tool catalog. Options: `:backend` (see the module doc).
+  tool catalog. Options: `:backend` (see the module doc), `:sandbox`
+  (`%PurpleChonkyWhale.Sandbox{}` used to wrap `{:stdio, opts}` servers), and
+  `:require_sandbox?` (when `true`, refuse stdio servers without a sandbox).
 
   The supervisor and registry are linked to the caller; a component adopting
   them should `Process.unlink/1` both and bind their lifetime with
@@ -122,6 +124,8 @@ defmodule PurpleChonkyWhale.MCP do
   @spec start_link([server()], keyword()) :: {:ok, t()}
   def start_link(servers, opts \\ []) when is_list(servers) do
     backend = Keyword.get(opts, :backend, @default_backend)
+    sandbox = Keyword.get(opts, :sandbox)
+    require_sandbox? = Keyword.get(opts, :require_sandbox?, false) == true
 
     {:ok, sup} = DynamicSupervisor.start_link(strategy: :one_for_one)
     registry = :"pcw_mcp_registry_#{System.unique_integer([:positive])}"
@@ -132,7 +136,7 @@ defmodule PurpleChonkyWhale.MCP do
     catalog =
       servers
       |> Enum.flat_map(fn server ->
-        case connect(sup, registry, server, backend, finch) do
+        case connect(sup, registry, server, backend, finch, sandbox, require_sandbox?) do
           {:ok, entries} -> entries
           :error -> []
         end
@@ -188,23 +192,25 @@ defmodule PurpleChonkyWhale.MCP do
 
   ## Connecting
 
-  defp connect(sup, registry, %{name: name} = server, backend, finch) do
+  defp connect(sup, registry, %{name: name} = server, backend, finch, sandbox, require_sandbox?) do
     via = {:via, Registry, {registry, name}}
     timeout = Map.get(server, :timeout, @default_timeout)
 
-    client_opts = [
-      name: via,
-      transport_name: {:via, Registry, {registry, {name, :transport}}},
-      transport: server |> Map.fetch!(:transport) |> inject_finch(finch),
-      client_info: Map.get(server, :client_info, @default_client_info),
-      capabilities: %{}
-    ]
+    raw_transport = server |> Map.fetch!(:transport) |> inject_finch(finch)
 
-    # :temporary so a crash-looping server can never exhaust the supervisor's
-    # intensity and take the healthy clients down with it (fail-open).
-    spec = client_opts |> backend.child_spec() |> Supervisor.child_spec(restart: :temporary)
-
-    with {:ok, _pid} <- start_child(sup, spec),
+    with {:ok, transport} <- prepare_transport(raw_transport, sandbox, require_sandbox?),
+         client_opts = [
+           name: via,
+           transport_name: {:via, Registry, {registry, {name, :transport}}},
+           transport: transport,
+           client_info: Map.get(server, :client_info, @default_client_info),
+           capabilities: %{}
+         ],
+         # :temporary so a crash-looping server can never exhaust the supervisor's
+         # intensity and take the healthy clients down with it (fail-open).
+         spec =
+           client_opts |> backend.child_spec() |> Supervisor.child_spec(restart: :temporary),
+         {:ok, _pid} <- start_child(sup, spec),
          :ok <- ready(backend, via, timeout),
          {:ok, tools} <- fetch_tools(backend, via, timeout) do
       {:ok, Enum.map(tools, &catalog_entry(name, &1, timeout))}
@@ -225,6 +231,19 @@ defmodule PurpleChonkyWhale.MCP do
         :error
     end
   end
+
+  defp prepare_transport({:stdio, stdio_opts}, %Sandbox{} = sandbox, _require_sandbox?)
+       when is_list(stdio_opts) do
+    with {:ok, wrapped} <- Sandbox.wrap_stdio(sandbox, stdio_opts) do
+      {:ok, {:stdio, wrapped}}
+    end
+  end
+
+  defp prepare_transport({:stdio, _stdio_opts}, nil, true) do
+    {:error, "stdio MCP server requires a :sandbox"}
+  end
+
+  defp prepare_transport(transport, _sandbox, _require_sandbox?), do: {:ok, transport}
 
   # The streamable HTTP transport talks through a Finch pool that Anubis
   # expects the caller to provide ("you must start this pool yourself"). One
