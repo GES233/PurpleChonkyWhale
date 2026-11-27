@@ -20,7 +20,7 @@ defmodule Noctilucent.CLI do
     * `--help, -h`
 
   Slash commands while chatting: `/quit` `/cancel` `/steer TEXT` `/reset`
-  `/sessions` `/resume ID` `/log`.
+  `/sessions` `/resume ID` `/log` `/grants` `/revoke`.
 
   Attach images inline with `@path/to/image.png` (png/jpeg/gif/webp, ≤ 5 MB,
   resolved against the working directory); attachments are ignored with a
@@ -32,8 +32,8 @@ defmodule Noctilucent.CLI do
   `user/message` events and runs turns.
   """
 
-  alias Noctilucent.Presets
-  alias PurpleChonkyWhale.{AgentRun, Memory, Session, Sessions, Tools}
+  alias Noctilucent.{Policy, Presets}
+  alias PurpleChonkyWhale.{AgentRun, Memory, Security.Grant, Session, Sessions, Tools}
   alias Dexterous.Context
 
   @switches [
@@ -55,6 +55,8 @@ defmodule Noctilucent.CLI do
     {"/sessions", "list saved session ids"},
     {"/resume ID", "switch to (or open) session ID"},
     {"/log", "print the model-visible message count"},
+    {"/grants", "list active capability leases"},
+    {"/revoke", "revoke all active capability leases"},
     {"/help", "show the commands and options"}
   ]
 
@@ -153,9 +155,14 @@ defmodule Noctilucent.CLI do
 
     ctx = Dexterous.root()
     subscribe_renderers(ctx)
+    repl = self()
 
     entries_opts =
-      [cwd: cwd, llm_opts: if_set(:base_url, config.base_url)] ++
+      [
+        cwd: cwd,
+        llm_opts: if_set(:base_url, config.base_url),
+        policy_opts: [ask: &request_approval(repl, &1)]
+      ] ++
         if_set(:home, config.home) ++
         if_set(:model, config.model)
 
@@ -173,6 +180,7 @@ defmodule Noctilucent.CLI do
     sessions = await(ctx, :sessions)
     tools = await(ctx, :tools)
     memory = await(ctx, :memory)
+    policy = await(ctx, :policy)
 
     system = Presets.system_prompt(config.persona, cwd: cwd) <> skill_section(tools)
 
@@ -203,6 +211,7 @@ defmodule Noctilucent.CLI do
       system: system,
       llm: llm,
       tools: tools,
+      policy: policy,
       persona: config.persona,
       cwd: cwd,
       vision?: tools.env[:vision?] != false,
@@ -495,6 +504,15 @@ defmodule Noctilucent.CLI do
         IO.puts("[session #{state.session_id}: #{count} model-visible messages so far]")
         loop(state, rest, eof?)
 
+      {:line, "/grants", rest, eof?} ->
+        state.policy |> Policy.leases() |> format_leases() |> IO.puts()
+        loop(state, rest, eof?)
+
+      {:line, "/revoke", rest, eof?} ->
+        :ok = Policy.revoke_all(state.policy)
+        IO.puts("[revoked all active capability leases]")
+        loop(state, rest, eof?)
+
       {:line, "/" <> _unknown = cmd, rest, eof?} ->
         IO.puts("[unknown command #{cmd} — #{Enum.map_join(@commands, ", ", &elem(&1, 0))}]")
         loop(state, rest, eof?)
@@ -538,13 +556,17 @@ defmodule Noctilucent.CLI do
   defp await_run(run_pid, run_id, pending, eof?) do
     receive do
       {:run_finished, ^run_id, outcome} ->
-        case outcome do
-          {:ok, _text} -> IO.puts("\n== turn complete (#{run_id}) ==")
-          {:error, {:cancelled, reason}} -> IO.puts("\n== turn cancelled: #{inspect(reason)} ==")
-          {:error, error} -> IO.puts("\n== turn failed: #{inspect(error)} ==")
-        end
-
+        print_run_outcome(run_id, outcome)
         {Enum.reverse(pending), eof?}
+
+      {:approval_request, ref, requester, request} ->
+        if eof? do
+          send(requester, {:approval_reply, ref, :deny})
+          await_run(run_pid, run_id, pending, eof?)
+        else
+          IO.puts("\n" <> format_approval_prompt(request))
+          await_approval_reply(run_pid, run_id, ref, requester, request, pending, eof?)
+        end
 
       {:stdin_line, "/cancel"} ->
         IO.puts("\n[cancelling #{run_id}...]")
@@ -577,5 +599,122 @@ defmodule Noctilucent.CLI do
       :stdin_eof ->
         await_run(run_pid, run_id, pending, true)
     end
+  end
+
+  defp await_approval_reply(run_pid, run_id, ref, requester, request, pending, eof?) do
+    receive do
+      {:run_finished, ^run_id, outcome} ->
+        send(requester, {:approval_reply, ref, :deny})
+        print_run_outcome(run_id, outcome)
+        {Enum.reverse(pending), eof?}
+
+      {:stdin_line, "/cancel"} ->
+        send(requester, {:approval_reply, ref, :deny})
+        IO.puts("\n[cancelling #{run_id}...]")
+        Task.start(fn -> AgentRun.cancel(run_pid, "cancelled by user") end)
+        await_run(run_pid, run_id, pending, eof?)
+
+      {:stdin_line, line} ->
+        choice = parse_approval_choice(line, request)
+        send(requester, {:approval_reply, ref, choice})
+        await_run(run_pid, run_id, pending, eof?)
+
+      :stdin_eof ->
+        send(requester, {:approval_reply, ref, :deny})
+        await_run(run_pid, run_id, pending, true)
+    end
+  end
+
+  defp print_run_outcome(run_id, outcome) do
+    case outcome do
+      {:ok, _text} -> IO.puts("\n== turn complete (#{run_id}) ==")
+      {:error, {:cancelled, reason}} -> IO.puts("\n== turn cancelled: #{inspect(reason)} ==")
+      {:error, error} -> IO.puts("\n== turn failed: #{inspect(error)} ==")
+    end
+  end
+
+  defp request_approval(repl, request) do
+    ref = make_ref()
+    mon = Process.monitor(repl)
+    send(repl, {:approval_request, ref, self(), request})
+
+    receive do
+      {:approval_reply, ^ref, choice} ->
+        Process.demonitor(mon, [:flush])
+        choice
+
+      {:DOWN, ^mon, :process, ^repl, _reason} ->
+        :deny
+    end
+  end
+
+  @doc false
+  def parse_approval_choice(line, request) when is_binary(line) and is_map(request) do
+    leaseable = Map.get(request, :leaseable_capabilities, [])
+    default_ttl = Map.get(request, :default_lease_ms, 15 * 60_000)
+
+    case line |> String.trim() |> String.downcase() do
+      choice when choice in ["y", "yes", "once"] ->
+        :once
+
+      choice when choice in ["l", "lease"] and leaseable != [] ->
+        {:lease, default_ttl}
+
+      _other ->
+        :deny
+    end
+  end
+
+  @doc false
+  def format_approval_prompt(request) when is_map(request) do
+    caps = request |> Map.get(:capabilities, []) |> Enum.map_join(", ", &to_string/1)
+    warnings = Map.get(request, :warnings, [])
+    leaseable = Map.get(request, :leaseable_capabilities, [])
+    ttl_min = max(1, div(Map.get(request, :default_lease_ms, 15 * 60_000), 60_000))
+
+    warning_lines =
+      case warnings do
+        [] -> []
+        list -> Enum.map(list, &"  ! warning: #{&1}")
+      end
+
+    options =
+      case leaseable do
+        [] ->
+          "  [y] allow once  /  [n] deny (default: deny)"
+
+        caps_list ->
+          cap_label = Enum.map_join(caps_list, "+", &to_string/1)
+
+          "  [y] allow once  /  [l] lease #{cap_label} for #{ttl_min}m  /  [n] deny (default: deny)"
+      end
+
+    ([
+       "[approval required] #{Map.get(request, :summary, request[:tool])}",
+       "  tool: #{request[:tool]}  capabilities: [#{caps}]"
+     ] ++ warning_lines ++ [options])
+    |> Enum.join("\n")
+  end
+
+  @doc false
+  def format_leases([]), do: "[active leases: none]"
+
+  def format_leases(leases) when is_list(leases) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    lines =
+      Enum.map(leases, fn %Grant{} = grant ->
+        caps = grant.capabilities |> Enum.sort() |> Enum.map_join(", ", &to_string/1)
+
+        ttl =
+          case Grant.remaining_ms(grant, now_ms) do
+            nil -> "no expiry"
+            ms -> "#{div(ms + 999, 1000)}s left"
+          end
+
+        "  - [#{caps}] (#{ttl}) #{grant.reason}"
+      end)
+
+    Enum.join(["[active leases (#{length(leases)})]" | lines], "\n")
   end
 end

@@ -102,6 +102,7 @@ end
 llm = await.(:llm)
 sessions = await.(:sessions)
 tools = await.(:tools)
+_policy = await.(:policy)
 
 {:ok, session} = Sessions.open(sessions, "image-demo-#{System.unique_integer([:positive])}")
 

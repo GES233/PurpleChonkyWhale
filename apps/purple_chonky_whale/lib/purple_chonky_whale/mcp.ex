@@ -353,6 +353,9 @@ defmodule PurpleChonkyWhale.MCP do
         @behaviour PurpleChonkyWhale.Tool
 
         @impl true
+        def capabilities, do: [:mcp]
+
+        @impl true
         def schema, do: unquote(Macro.escape(entry.schema))
 
         @impl true

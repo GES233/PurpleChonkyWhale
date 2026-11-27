@@ -21,6 +21,9 @@ defmodule PurpleChonkyWhale.Tools.Edit do
   @bom "\xEF\xBB\xBF"
 
   @impl true
+  def capabilities, do: [:fs_write]
+
+  @impl true
   def schema do
     %{
       name: "edit",

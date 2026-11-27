@@ -15,6 +15,9 @@ defmodule PurpleChonkyWhale.Tools.MemorySave do
   alias Dexterous.Context
 
   @impl true
+  def capabilities, do: [:memory]
+
+  @impl true
   def schema do
     %{
       name: "memory_save",

@@ -31,6 +31,9 @@ defmodule PurpleChonkyWhale.Tools.Grep do
   @sniff_bytes 8192
 
   @impl true
+  def capabilities, do: [:fs_read]
+
+  @impl true
   def schema do
     %{
       name: "grep",

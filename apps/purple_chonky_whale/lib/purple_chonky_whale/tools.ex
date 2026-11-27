@@ -14,6 +14,10 @@ defmodule PurpleChonkyWhale.Tools do
     * `:tools` — the tool modules (each implementing `PurpleChonkyWhale.Tool`)
     * `:env` — the execution environment handed to every `execute/2`
       (e.g. `%{cwd: ...}`), defaults to `%{}`
+    * `:require_grant?` — when `true`, every tool call must obtain a valid
+      `{:allow, %PurpleChonkyWhale.Security.Grant{}}` from `:"tools/pre-execute"`
+      whose capabilities, tool scope and TTL cover the target tool; defaults to
+      `false` for bare kernel compositions
     * `:mcp_servers` — MCP server declarations (see
       `PurpleChonkyWhale.MCP`), defaults to `[]` (no processes, no behaviour
       change). Each server's tools are registered as ordinary tools named
@@ -33,11 +37,14 @@ defmodule PurpleChonkyWhale.Tools do
   `execute/3` and `execute/4` run a call through the scope's events (consumers
   of the seam subscribe with `Context.on/3`):
 
-    * `:"tools/pre-execute"` — a *waterfall* over
-      `%{name:, arguments:, decision: :run, session_id:, run_id:, tool_call_id:}`.
-      Listeners may rewrite the arguments, or deny the call by transforming
-      `decision` to `{:deny, reason}` (typically also declining `next.()` to
-      short-circuit the chain). This is where approval policy hooks in.
+    * `:"tools/pre-execute"` — a *fail-closed, monotonic waterfall* over
+      `%{name:, arguments:, capabilities:, decision:, session_id:, run_id:, tool_call_id:}`.
+      Listeners may rewrite arguments or narrow `decision` to
+      `{:allow, %PurpleChonkyWhale.Security.Grant{}}` or `{:deny, reason}`.
+      Decisions are strictly monotonic across the chain: a `{:deny, reason}`
+      cannot be undone by later or wrapping listeners, multiple grants are
+      intersected via `Grant.narrow/2`, and any listener crash or invalid
+      payload/decision fails closed to `:denied`.
     * `:"tools/post-execute"` — an *emit* with
       `%{name:, arguments:, result:, duration_ms:, session_id:, run_id:, tool_call_id:}`
       for every settled call.
@@ -50,18 +57,20 @@ defmodule PurpleChonkyWhale.Tools do
 
   require Logger
 
-  alias Dexterous.Context
-  alias PurpleChonkyWhale.MCP
+  alias Dexterous.{Context, Store}
+  alias PurpleChonkyWhale.{MCP, Tool}
+  alias PurpleChonkyWhale.Security.Grant
 
   @typedoc "The tool registry handle, the value bound to the `:tools` coeffect."
   @type t :: %__MODULE__{
           tools: %{String.t() => module()},
           env: map(),
           scope: Context.scope(),
-          mcp: MCP.t() | nil
+          mcp: MCP.t() | nil,
+          require_grant?: boolean()
         }
 
-  defstruct [:tools, :env, :scope, :mcp]
+  defstruct [:tools, :env, :scope, :mcp, require_grant?: false]
 
   @pre_event :"tools/pre-execute"
   @post_event :"tools/post-execute"
@@ -86,8 +95,15 @@ defmodule PurpleChonkyWhale.Tools do
     tools = Map.merge(mcp_tools, static_tools)
 
     env = Keyword.get(config, :env, %{})
+    require_grant? = Keyword.get(config, :require_grant?, false) == true
 
-    Context.set(ctx, :tools, %__MODULE__{tools: tools, env: env, scope: ctx.scope, mcp: mcp})
+    Context.set(ctx, :tools, %__MODULE__{
+      tools: tools,
+      env: env,
+      scope: ctx.scope,
+      mcp: mcp,
+      require_grant?: require_grant?
+    })
   end
 
   # No `:mcp_servers` (the default) means no processes and zero behaviour
@@ -155,20 +171,28 @@ defmodule PurpleChonkyWhale.Tools do
     ctx = Context.new(registry.scope)
     env = derive_env(registry, call_env)
 
-    call = %{
-      name: name,
-      arguments: arguments,
-      decision: :run,
-      session_id: env[:session_id],
-      run_id: env[:run_id],
-      tool_call_id: env[:tool_call_id]
-    }
+    case lookup(registry, name) do
+      :error ->
+        result = {:error, %{type: :unknown_tool, message: "unknown tool: #{name}"}}
+        emit_post(ctx, name, arguments, result, 0, env)
+        result
 
-    call = Context.waterfall(ctx, @pre_event, call)
+      {:ok, module} ->
+        caps = Tool.capabilities(module)
+        initial_decision = if registry.require_grant?, do: :pending, else: :run
 
-    case call.decision do
-      :run -> run(registry, call, env, ctx)
-      {:deny, reason} -> {:error, %{type: :denied, message: to_string(reason)}}
+        call = %{
+          name: name,
+          arguments: arguments,
+          capabilities: caps,
+          decision: initial_decision,
+          session_id: env[:session_id],
+          run_id: env[:run_id],
+          tool_call_id: env[:tool_call_id]
+        }
+
+        final_call = run_pre_execute(ctx, call, registry.require_grant?)
+        enforce_and_run(registry, final_call, env, ctx)
     end
   end
 
@@ -178,32 +202,203 @@ defmodule PurpleChonkyWhale.Tools do
     |> Map.merge(Map.new(call_env))
   end
 
-  defp run(registry, call, env, ctx) do
+  defp run_pre_execute(ctx, call, require_grant?) do
+    ref = make_ref()
+    key = {__MODULE__, ref}
+    Process.put(key, call.decision)
+
+    try do
+      listeners = Store.listeners_for(ctx.scope, @pre_event)
+      result = run_pre_chain(listeners, call, key, require_grant?)
+      floor = Process.get(key)
+
+      case result do
+        %{name: out_name, arguments: out_args} when is_binary(out_name) and is_map(out_args) ->
+          merged = monotonic_decision(floor, Map.get(result, :decision), require_grant?)
+          %{result | decision: merged}
+
+        %{} ->
+          %{call | decision: {:deny, "invalid pre-execute payload: missing name or arguments"}}
+
+        _other ->
+          %{call | decision: {:deny, "invalid pre-execute payload"}}
+      end
+    rescue
+      exception ->
+        %{call | decision: {:deny, "pre-execute hook failed: #{Exception.message(exception)}"}}
+    catch
+      :throw, {:invalid_pre_payload, _other} ->
+        %{call | decision: {:deny, "invalid pre-execute payload"}}
+
+      kind, reason ->
+        %{call | decision: {:deny, "pre-execute hook failed: #{kind}: #{inspect(reason)}"}}
+    after
+      Process.delete(key)
+    end
+  end
+
+  defp run_pre_chain([], payload, key, require_grant?) do
+    record_decision(payload, key, require_grant?)
+  end
+
+  defp run_pre_chain([listener | rest], payload, key, require_grant?) do
+    payload = record_decision(payload, key, require_grant?)
+
+    out =
+      case Function.info(listener, :arity) do
+        {:arity, 1} ->
+          next_payload = listener.(payload) |> record_decision(key, require_grant?)
+          run_pre_chain(rest, next_payload, key, require_grant?)
+
+        {:arity, 2} ->
+          listener.(payload, fn new_payload ->
+            next_payload = record_decision(new_payload, key, require_grant?)
+            run_pre_chain(rest, next_payload, key, require_grant?)
+          end)
+      end
+
+    record_decision(out, key, require_grant?)
+  end
+
+  defp record_decision(payload, key, require_grant?) when is_map(payload) do
+    floor = Process.get(key)
+    merged = monotonic_decision(floor, Map.get(payload, :decision), require_grant?)
+    Process.put(key, merged)
+    Map.put(payload, :decision, merged)
+  end
+
+  defp record_decision(other, _key, _require_grant?) do
+    throw({:invalid_pre_payload, other})
+  end
+
+  # Strictly monotonic decision lattice:
+  #   :run (only when require_grant? == false) -> :pending / {:allow, %Grant{}} -> {:deny, reason}
+  # Once denied, no listener may un-deny; two grants combine via Grant.narrow/2.
+  defp monotonic_decision({:deny, _} = deny, _candidate, _require_grant?), do: deny
+  defp monotonic_decision(_current, {:deny, _} = deny, _require_grant?), do: deny
+
+  defp monotonic_decision(current, candidate, require_grant?) do
+    cond do
+      not valid_decision?(candidate) ->
+        {:deny, "invalid pre-execute decision: #{inspect(candidate)}"}
+
+      match?({:allow, %Grant{}}, current) and match?({:allow, %Grant{}}, candidate) ->
+        {:allow, grant_a} = current
+        {:allow, grant_b} = candidate
+        {:allow, Grant.narrow(grant_a, grant_b)}
+
+      match?({:allow, %Grant{}}, current) ->
+        current
+
+      match?({:allow, %Grant{}}, candidate) ->
+        candidate
+
+      current == :pending ->
+        :pending
+
+      candidate == :pending ->
+        :pending
+
+      require_grant? ->
+        :pending
+
+      true ->
+        :run
+    end
+  end
+
+  defp valid_decision?(:run), do: true
+  defp valid_decision?(:pending), do: true
+  defp valid_decision?({:allow, %Grant{}}), do: true
+  defp valid_decision?(_other), do: false
+
+  defp enforce_and_run(_registry, %{decision: {:deny, reason}}, _env, _ctx) do
+    {:error, %{type: :denied, message: to_string(reason)}}
+  end
+
+  defp enforce_and_run(registry, call, env, ctx) do
+    case lookup(registry, call.name) do
+      :error ->
+        result = {:error, %{type: :unknown_tool, message: "unknown tool: #{call.name}"}}
+        emit_post(ctx, call.name, call.arguments, result, 0, env)
+        result
+
+      {:ok, module} ->
+        caps = Tool.capabilities(module)
+
+        case call.decision do
+          {:allow, %Grant{} = grant} ->
+            if Grant.allows?(grant, call.name, caps) do
+              run_module(module, call, Grant.apply_to_env(grant, env), ctx)
+            else
+              {:error, %{type: :denied, message: denial_message(grant, call.name, caps)}}
+            end
+
+          :run when not registry.require_grant? ->
+            run_module(module, call, env, ctx)
+
+          :run ->
+            {:error,
+             %{
+               type: :denied,
+               message: "denied: tool #{call.name} requires an explicit capability grant"
+             }}
+
+          _other ->
+            {:error,
+             %{
+               type: :denied,
+               message: "denied: no matching capability grant for #{call.name}"
+             }}
+        end
+    end
+  end
+
+  defp denial_message(%Grant{} = grant, name, caps) do
+    cond do
+      Grant.expired?(grant, System.monotonic_time(:millisecond)) ->
+        "denied: capability grant for #{name} has expired"
+
+      grant.tools != :any and not MapSet.member?(grant.tools, name) ->
+        "denied: capability grant does not cover tool #{name}"
+
+      true ->
+        missing =
+          caps
+          |> MapSet.new()
+          |> MapSet.difference(grant.capabilities)
+          |> MapSet.to_list()
+
+        "denied: grant missing required capabilities #{inspect(missing)} for #{name}"
+    end
+  end
+
+  defp run_module(module, call, env, ctx) do
     started = System.monotonic_time(:millisecond)
 
     result =
-      with {:ok, module} <- lookup(registry, call.name) do
-        try do
-          module.execute(call.arguments, env)
-        rescue
-          exception -> {:error, %{type: :crashed, message: Exception.message(exception)}}
-        catch
-          kind, reason -> {:error, %{type: :crashed, message: "#{kind}: #{inspect(reason)}"}}
-        end
-      else
-        :error -> {:error, %{type: :unknown_tool, message: "unknown tool: #{call.name}"}}
+      try do
+        module.execute(call.arguments, env)
+      rescue
+        exception -> {:error, %{type: :crashed, message: Exception.message(exception)}}
+      catch
+        kind, reason -> {:error, %{type: :crashed, message: "#{kind}: #{inspect(reason)}"}}
       end
 
+    duration = System.monotonic_time(:millisecond) - started
+    emit_post(ctx, call.name, call.arguments, result, duration, env)
+    result
+  end
+
+  defp emit_post(ctx, name, arguments, result, duration_ms, env) do
     Context.emit(ctx, @post_event, %{
-      name: call.name,
-      arguments: call.arguments,
+      name: name,
+      arguments: arguments,
       result: result,
-      duration_ms: System.monotonic_time(:millisecond) - started,
+      duration_ms: duration_ms,
       session_id: env[:session_id],
       run_id: env[:run_id],
       tool_call_id: env[:tool_call_id]
     })
-
-    result
   end
 end

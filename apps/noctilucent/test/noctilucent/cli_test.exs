@@ -90,4 +90,53 @@ defmodule Noctilucent.CLITest do
       assert notice =~ "no image input"
     end
   end
+
+  describe "approval helpers" do
+    test "parse_approval_choice/2 handles once, lease, and fail-closed deny" do
+      leaseable = %{leaseable_capabilities: [:fs_write], default_lease_ms: 900_000}
+      high_risk = %{leaseable_capabilities: [], default_lease_ms: 900_000}
+
+      assert CLI.parse_approval_choice("y", leaseable) == :once
+      assert CLI.parse_approval_choice("YES", leaseable) == :once
+      assert CLI.parse_approval_choice("l", leaseable) == {:lease, 900_000}
+      assert CLI.parse_approval_choice("lease", leaseable) == {:lease, 900_000}
+      assert CLI.parse_approval_choice("", leaseable) == :deny
+      assert CLI.parse_approval_choice("n", leaseable) == :deny
+      assert CLI.parse_approval_choice("bogus", leaseable) == :deny
+
+      # High-risk requests cannot be leased via "l"
+      assert CLI.parse_approval_choice("l", high_risk) == :deny
+      assert CLI.parse_approval_choice("y", high_risk) == :once
+    end
+
+    test "format_approval_prompt/1 and format_leases/1 render warnings and leases" do
+      prompt =
+        CLI.format_approval_prompt(%{
+          tool: "execute",
+          summary: "execute (shell): git reset --hard",
+          capabilities: [:exec],
+          warnings: ["destructive git operation"],
+          leaseable_capabilities: [],
+          default_lease_ms: 900_000
+        })
+
+      assert prompt =~ "[approval required]"
+      assert prompt =~ "destructive git operation"
+      refute prompt =~ "[l] lease"
+
+      assert CLI.format_leases([]) == "[active leases: none]"
+
+      grant =
+        PurpleChonkyWhale.Security.Grant.new(
+          capabilities: [:fs_write],
+          ttl_ms: 60_000,
+          reason: "user lease"
+        )
+
+      rendered = CLI.format_leases([grant])
+      assert rendered =~ "[active leases (1)]"
+      assert rendered =~ "fs_write"
+      assert rendered =~ "user lease"
+    end
+  end
 end

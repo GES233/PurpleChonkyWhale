@@ -30,12 +30,15 @@ defmodule Noctilucent.Presets do
       `PurpleChonkyWhale.MCP`), passed through to the `:tools` entry config;
       defaults to `[]`, so no MCP client (and no external subprocess) starts
       unless the caller opts in
+    * `:policy_opts` — extra config passed to `Noctilucent.Policy` (e.g.
+      `:ask`, `:auto_allow`, `:lease_ttl_ms`, `:initial_leases`)
 
   The skill directory chain (earlier entries win name collisions) is:
   workspace (`<cwd>/.agents/skills`, `<cwd>/.claude/skills`, `<cwd>/skills`)
   → persona (`<home>/<persona>/skills`) → global (`~/.agents/skills`).
   """
 
+  alias Noctilucent.Policy
   alias PurpleChonkyWhale.{LLM, Memory, Sessions, Tools}
   alias DexterousLoader.Entry
 
@@ -50,8 +53,8 @@ defmodule Noctilucent.Presets do
   def personas, do: @personas
 
   @doc """
-  The three seam entries (`:llm`, `:sessions`, `:tools`) composing `persona`.
-  Raises `FunctionClauseError` for unknown personas.
+  The five seam entries (`:llm`, `:sessions`, `:tools`, `:memory`, `:policy`)
+  composing `persona`. Raises `FunctionClauseError` for unknown personas.
   """
   @spec entries(persona(), keyword()) :: [Entry.t()]
   def entries(persona, opts \\ []) when persona in @personas do
@@ -60,6 +63,8 @@ defmodule Noctilucent.Presets do
     model = Keyword.get(opts, :model, @default_model)
     llm_opts = Keyword.get(opts, :llm_opts, [])
     mcp_servers = Keyword.get(opts, :mcp_servers, [])
+    policy_opts = Keyword.get(opts, :policy_opts, [])
+    protected = protected_dirs(home)
 
     [
       %Entry{id: :llm, component: LLM, config: [model: model] ++ llm_opts},
@@ -73,11 +78,12 @@ defmodule Noctilucent.Presets do
         component: Tools,
         config: [
           tools: tools_for(persona),
+          require_grant?: true,
           env: %{
             cwd: cwd,
             skill_dirs: skill_dirs(home, persona, cwd),
             vision?: vision?(model),
-            protected_dirs: protected_dirs(home),
+            protected_dirs: protected,
             allowed_runtimes: PurpleChonkyWhale.Tools.Executor.default_allowed_runtimes()
           },
           mcp_servers: mcp_servers
@@ -87,6 +93,15 @@ defmodule Noctilucent.Presets do
         id: :memory,
         component: Memory,
         config: [layers: memory_layers(home, persona)]
+      },
+      %Entry{
+        id: :policy,
+        component: Policy,
+        config:
+          Keyword.merge(
+            [persona: persona, cwd: cwd, home: home, protected_dirs: protected],
+            policy_opts
+          )
       }
     ]
   end

@@ -9,6 +9,9 @@ defmodule PurpleChonkyWhale.Tools.Write do
   alias PurpleChonkyWhale.Tool
 
   @impl true
+  def capabilities, do: [:fs_write]
+
+  @impl true
   def schema do
     %{
       name: "write",

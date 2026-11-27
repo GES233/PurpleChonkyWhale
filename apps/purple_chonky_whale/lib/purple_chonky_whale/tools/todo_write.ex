@@ -20,6 +20,9 @@ defmodule PurpleChonkyWhale.Tools.TodoWrite do
   @todo_event :"tools/todo"
 
   @impl true
+  def capabilities, do: [:ui]
+
+  @impl true
   def schema do
     %{
       name: "todo_write",

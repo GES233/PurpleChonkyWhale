@@ -23,6 +23,9 @@ defmodule PurpleChonkyWhale.Tools.Recompile do
   @behaviour PurpleChonkyWhale.Tool
 
   @impl true
+  def capabilities, do: [:hmr]
+
+  @impl true
   def schema do
     %{
       name: "recompile",

@@ -88,6 +88,9 @@ defmodule PurpleChonkyWhale.Tools.Executor do
   alias PurpleChonkyWhale.Tool
 
   @impl true
+  def capabilities, do: [:exec]
+
+  @impl true
   def schema do
     %{
       name: "execute",

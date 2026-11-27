@@ -3,13 +3,14 @@ defmodule Noctilucent.PresetsTest do
 
   @moduletag :tmp_dir
 
-  alias Noctilucent.Presets
+  alias Noctilucent.{Policy, Presets}
   alias PurpleChonkyWhale.{LLM, Memory, Sessions, Tools}
+  alias Dexterous.Context
   alias DexterousLoader.Entry
 
   defp entry(entries, id), do: Enum.find(entries, &(&1.id == id))
 
-  test "every persona mounts the four seams", %{tmp_dir: tmp_dir} do
+  test "every persona mounts the four seams plus policy", %{tmp_dir: tmp_dir} do
     for persona <- Presets.personas() do
       entries = Presets.entries(persona, home: tmp_dir, cwd: tmp_dir)
 
@@ -17,8 +18,46 @@ defmodule Noctilucent.PresetsTest do
                %Entry{id: :llm, component: LLM},
                %Entry{id: :sessions, component: Sessions},
                %Entry{id: :tools, component: Tools},
-               %Entry{id: :memory, component: Memory}
+               %Entry{id: :memory, component: Memory},
+               %Entry{id: :policy, component: Policy}
              ] = entries
+
+      tools_config = entry(entries, :tools).config
+      assert Keyword.fetch!(tools_config, :require_grant?) == true
+    end
+  end
+
+  test "Presets composition enforces Policy gate end-to-end (reads allowed, writes fail closed without ask)",
+       %{tmp_dir: tmp_dir} do
+    cwd = Path.join(tmp_dir, "work")
+    File.mkdir_p!(cwd)
+    File.write!(Path.join(cwd, "note.txt"), "hello")
+
+    scope = :"presets_policy_e2e_#{System.unique_integer([:positive])}"
+    ctx = Context.new(scope)
+    entries = Presets.entries(:coding, home: Path.join(tmp_dir, "home"), cwd: cwd)
+    {:ok, _loader} = DexterousLoader.start_link(ctx, entries)
+
+    tools = await_binding(ctx, :tools)
+    _policy = await_binding(ctx, :policy)
+
+    assert {:ok, "1\thello"} = Tools.execute(tools, "read", %{"file_path" => "note.txt"})
+
+    assert {:error, %{type: :denied}} =
+             Tools.execute(tools, "write", %{"file_path" => "out.txt", "content" => "blocked"})
+  end
+
+  defp await_binding(ctx, key, attempts \\ 50)
+  defp await_binding(_ctx, key, 0), do: raise("#{key} not bound in time")
+
+  defp await_binding(ctx, key, attempts) do
+    case Context.get(ctx, key) do
+      {:ok, val} ->
+        val
+
+      :error ->
+        Process.sleep(10)
+        await_binding(ctx, key, attempts - 1)
     end
   end
 

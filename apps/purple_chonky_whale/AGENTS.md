@@ -99,14 +99,19 @@ temp file).
   message (`content`, `details`, `isError`) and projects them to ReqLLM.
   `{:ok, {:parts, parts}}` outputs (built with `text_part/1` / `image_part/2`)
   become multi-part `content`; image parts project to `ContentPart.image/2`.
-- `Tools` — registry + guarded pipeline (`lookup/2`, `schemas/1`,
+- `Tools` — registry + fail-closed monotonic pipeline (`lookup/2`, `schemas/1`,
   `execute/3`); typed results `{:ok, _}` | `{:error, %{type:, message:}}` with
-  `:type ∈ {:unknown_tool, :denied, :crashed}`. With `:mcp_servers` configured
-  it also owns the MCP clients (supervisor + registry, lifetime bound to the
-  composition via `Context.track/2`, like `Sessions`) and merges their
-  generated tool modules into the registry; a static tool wins a name
-  collision (with a warning). The `%Tools{}` handle keeps the `%MCP{}` in its
-  `:mcp` field.
+  `:type ∈ {:unknown_tool, :denied, :crashed}`. `execute/4` runs
+  `tools/pre-execute` monotonically (once `{:deny, _}` is set it cannot be
+  undone, grants combine via `Security.Grant.narrow/2`, and any hook crash or
+  invalid payload fails closed to `:denied`). With `require_grant?: true`,
+  every call requires an explicit `{:allow, %Security.Grant{}}` covering the
+  target tool's capabilities and optional runtime/root constraints. With
+  `:mcp_servers` configured it also owns the MCP clients (supervisor +
+  registry, lifetime bound to the composition via `Context.track/2`, like
+  `Sessions`) and merges their generated tool modules into the registry; a
+  static tool wins a name collision (with a warning). The `%Tools{}` handle
+  keeps the `%MCP{}` in its `:mcp` field.
 - `MCP` — MCP servers as a tool source (internal, not a seam): connects to
   each declared server via Anubis, lists its tools and `Module.create/3`s a
   self-contained `Tool` module per tool, named `mcp_<server>_<tool>`
@@ -121,8 +126,12 @@ temp file).
   pool); a transport naming its own `:finch_name` is used as given, stdio-only
   compositions get none. `:backend` defaults to `Anubis.Client` and is faked
   in tests, mirroring `LLM`'s `:backend`.
-- `Tool` — the tool contract (`schema/0`, `execute/2`) plus `resolve_path/2`
-  and `authorize_path/3`.
+- `Tool` — the tool contract (`schema/0`, `execute/2`, optional `capabilities/0`)
+  plus `capabilities/1` (defaulting undeclared tools to `[:unknown]`),
+  `resolve_path/2` and `authorize_path/3`.
+- `Security.Grant` — structured capability grant (`capabilities`, `tools`,
+  `writable_roots`, `readable_roots`, `allowed_runtimes`, `expires_at`) with
+  `allows?/4`, monotonic `narrow/2`, and `apply_to_env/2`.
 - `Security.PathGuard` — kernel-level path boundary enforcement (`realpath`
   with symlink-loop cap, segment-aware workspace root checks) and an
   unconditional write self-destruct floor (filesystem roots, OS system dirs,

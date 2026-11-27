@@ -12,6 +12,9 @@ defmodule PurpleChonkyWhale.Tools.MemoryUpdate do
   alias PurpleChonkyWhale.Tools.MemorySave
 
   @impl true
+  def capabilities, do: [:memory]
+
+  @impl true
   def schema do
     %{
       name: "memory_update",

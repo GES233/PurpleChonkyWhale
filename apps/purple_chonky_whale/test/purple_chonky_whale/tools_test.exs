@@ -1,7 +1,9 @@
 defmodule PurpleChonkyWhale.ToolsTest do
   use ExUnit.Case, async: false
 
-  alias PurpleChonkyWhale.Tools
+  alias PurpleChonkyWhale.{Tool, Tools}
+  alias PurpleChonkyWhale.Security.Grant
+  alias PurpleChonkyWhale.Tools.{Edit, Executor, Glob, Grep, MemoryDelete, MemorySave, MemoryUpdate, Read, Recompile, Skill, TodoWrite, Write}
   alias Dexterous.Context
 
   defmodule Echo do
@@ -143,6 +145,141 @@ defmodule PurpleChonkyWhale.ToolsTest do
   test "unknown tools and crashes are typed errors, not exceptions", %{registry: registry} do
     assert {:error, %{type: :unknown_tool}} = Tools.execute(registry, "nope", %{})
     assert {:error, %{type: :crashed, message: "boom"}} = Tools.execute(registry, "crash", %{})
+  end
+
+  test "Tool.capabilities/1 declares built-ins and defaults undeclared tools to [:unknown]" do
+    assert Tool.capabilities(Read) == [:fs_read]
+    assert Tool.capabilities(Glob) == [:fs_read]
+    assert Tool.capabilities(Grep) == [:fs_read]
+    assert Tool.capabilities(Skill) == [:fs_read]
+    assert Tool.capabilities(Write) == [:fs_write]
+    assert Tool.capabilities(Edit) == [:fs_write]
+    assert Tool.capabilities(Executor) == [:exec]
+    assert Tool.capabilities(Recompile) == [:hmr]
+    assert Tool.capabilities(TodoWrite) == [:ui]
+    assert Tool.capabilities(MemorySave) == [:memory]
+    assert Tool.capabilities(MemoryUpdate) == [:memory]
+    assert Tool.capabilities(MemoryDelete) == [:memory]
+    assert Tool.capabilities(Echo) == [:unknown]
+  end
+
+  test "fail-closed monotonic gate catches listener crashes, garbage decisions, and un-denies", %{
+    ctx: ctx,
+    registry: registry
+  } do
+    # Listener 1 denies and passes downstream (misbehaving middleware)
+    {:ok, d1} =
+      Context.on(ctx, :"tools/pre-execute", fn call, next ->
+        out = next.(%{call | decision: {:deny, "policy denied"}})
+        # Try to un-deny on the way back out
+        %{out | decision: :run}
+      end)
+
+    # Listener 2 tries to flip decision back to :run
+    {:ok, d2} =
+      Context.on(ctx, :"tools/pre-execute", fn call, next ->
+        next.(%{call | decision: :run})
+      end)
+
+    assert {:error, %{type: :denied, message: "policy denied"}} =
+             Tools.execute(registry, "echo", %{})
+
+    refute_received {:echo_executed, _}
+    d1.()
+    d2.()
+
+    # Crashing pre-execute listener fails closed to :denied
+    {:ok, d3} =
+      Context.on(ctx, :"tools/pre-execute", fn _call, _next -> raise "hook boom" end)
+
+    assert {:error, %{type: :denied, message: msg}} = Tools.execute(registry, "echo", %{})
+    assert msg =~ "pre-execute hook failed"
+    refute_received {:echo_executed, _}
+    d3.()
+
+    # Invalid decision fails closed to :denied
+    {:ok, d4} =
+      Context.on(ctx, :"tools/pre-execute", fn call, next ->
+        next.(%{call | decision: :allow_without_grant})
+      end)
+
+    assert {:error, %{type: :denied}} = Tools.execute(registry, "echo", %{})
+    refute_received {:echo_executed, _}
+    d4.()
+  end
+
+  test "require_grant?: true demands a matching Grant, narrows grants monotonically, and blocks escalation" do
+    scope = :"tools_grant_gate_#{System.unique_integer([:positive])}"
+    ctx = Context.new(scope)
+
+    {:ok, _} =
+      Context.use(ctx, Tools,
+        tools: [Read, Write, Echo],
+        require_grant?: true,
+        env: %{cwd: System.tmp_dir!()}
+      )
+
+    registry =
+      eventually(fn ->
+        case Context.get(ctx, :tools) do
+          {:ok, r} -> r
+          :error -> nil
+        end
+      end)
+
+    # No listener -> fails closed even if tool exists
+    assert {:error, %{type: :denied}} = Tools.execute(registry, "echo", %{})
+
+    # A listener returning :run cannot bypass require_grant?: true
+    {:ok, d_run} =
+      Context.on(ctx, :"tools/pre-execute", fn call, next ->
+        next.(%{call | decision: :run})
+      end)
+
+    assert {:error, %{type: :denied}} = Tools.execute(registry, "echo", %{})
+    d_run.()
+
+    # Listener 1 grants [:fs_read, :fs_write]; Listener 2 narrows to [:fs_read] only
+    {:ok, d_g1} =
+      Context.on(ctx, :"tools/pre-execute", fn call, next ->
+        grant = Grant.new(capabilities: [:fs_read, :fs_write])
+        next.(%{call | decision: {:allow, grant}})
+      end)
+
+    {:ok, d_g2} =
+      Context.on(ctx, :"tools/pre-execute", fn call, next ->
+        grant = Grant.new(capabilities: [:fs_read])
+        next.(%{call | decision: {:allow, grant}})
+      end)
+
+    assert {:error, %{type: :denied, message: msg}} =
+             Tools.execute(registry, "write", %{"file_path" => "x.txt", "content" => "x"})
+
+    assert msg =~ "missing required capabilities [:fs_write]"
+
+    # Attempting to rewrite call.name from "read" to "write" is also blocked at gate exit
+    {:ok, d_esc} =
+      Context.on(ctx, :"tools/pre-execute", fn call, next ->
+        next.(%{call | name: "write", arguments: %{"file_path" => "x.txt", "content" => "x"}})
+      end)
+
+    assert {:error, %{type: :denied}} =
+             Tools.execute(registry, "read", %{"file_path" => "x.txt"})
+
+    d_esc.()
+    d_g2.()
+    d_g1.()
+
+    # Expired grant is rejected
+    {:ok, d_exp} =
+      Context.on(ctx, :"tools/pre-execute", fn call, next ->
+        expired = Grant.new(capabilities: [:unknown], expires_at: System.monotonic_time(:millisecond) - 10)
+        next.(%{call | decision: {:allow, expired}})
+      end)
+
+    assert {:error, %{type: :denied, message: exp_msg}} = Tools.execute(registry, "echo", %{})
+    assert exp_msg =~ "expired"
+    d_exp.()
   end
 
   defp eventually(fun, attempts \\ 50)

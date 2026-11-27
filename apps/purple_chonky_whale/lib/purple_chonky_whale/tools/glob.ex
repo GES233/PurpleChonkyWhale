@@ -19,6 +19,9 @@ defmodule PurpleChonkyWhale.Tools.Glob do
   @default_limit 200
 
   @impl true
+  def capabilities, do: [:fs_read]
+
+  @impl true
   def schema do
     %{
       name: "glob",

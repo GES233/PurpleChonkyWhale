@@ -43,13 +43,40 @@ defmodule PurpleChonkyWhale.Tool do
   @typedoc "A tool's declarative schema; `parameters` is a JSON Schema map."
   @type schema :: %{name: String.t(), description: String.t(), parameters: map()}
 
+  @typedoc "Capability tag declared by a tool module for policy gating."
+  @type capability ::
+          :fs_read | :fs_write | :exec | :net | :hmr | :memory | :ui | :mcp | :unknown
+
   @typedoc "The execution environment handed to `execute/2` by the registry."
   @type env :: map()
 
   @callback schema() :: schema()
   @callback execute(args :: map(), env()) :: {:ok, term()} | {:error, term()}
+  @callback capabilities() :: [capability()]
+  @optional_callbacks capabilities: 0
 
   alias PurpleChonkyWhale.Security.PathGuard
+
+  @doc """
+  Return the capabilities declared by `module`.
+
+  Tools that omit `capabilities/0` (or return a non-list value) default to
+  `[:unknown]` so permission policies fail closed on undeclared tools.
+  """
+  @spec capabilities(module()) :: [capability()]
+  def capabilities(module) when is_atom(module) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :capabilities, 0) do
+      case module.capabilities() do
+        caps when is_list(caps) ->
+          if Enum.all?(caps, &is_atom/1), do: caps, else: [:unknown]
+
+        _other ->
+          [:unknown]
+      end
+    else
+      [:unknown]
+    end
+  end
 
   @doc """
   Resolve a model-supplied path against the environment's `:cwd` (falling

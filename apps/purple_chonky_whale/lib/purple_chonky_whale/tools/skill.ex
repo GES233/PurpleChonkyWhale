@@ -32,6 +32,9 @@ defmodule PurpleChonkyWhale.Tools.Skill do
         }
 
   @impl true
+  def capabilities, do: [:fs_read]
+
+  @impl true
   def schema do
     %{
       name: "skill",
