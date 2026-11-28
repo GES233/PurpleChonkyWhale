@@ -1,16 +1,16 @@
-defmodule Noctilucent.Policy.ShellLint do
+defmodule Clearance.Lint do
   @moduledoc """
   Static risk inspection for `execute` calls before they run or prompt.
 
   Dispatches by `runtime` so languages with built-in parsers are inspected
   structurally via AST rather than flat regex:
 
-    * `"elixir"` / `"elixir_subprocess"` — `Noctilucent.Policy.Ast.Elixir`
+    * `"elixir"` / `"elixir_subprocess"` — `Clearance.Lint.Ast.Elixir`
       (native `Code.string_to_quoted/2` inside BEAM).
-    * `"powershell"` — `Noctilucent.Policy.Ast.PowerShell` (.NET
+    * `"powershell"` — `Clearance.Lint.Ast.PowerShell` (.NET
       `Parser::ParseInput` via a lazy read-only Port worker, failing closed to
       regex + `:ask` if unavailable).
-    * `"python"` — `Noctilucent.Policy.Ast.Python` (stdlib `ast.parse` via a
+    * `"python"` — `Clearance.Lint.Ast.Python` (stdlib `ast.parse` via a
       lazy read-only Port worker, failing closed to regex + `:ask` if
       unavailable).
     * `"shell"` (and any other runtime) — static regex rules below.
@@ -31,8 +31,8 @@ defmodule Noctilucent.Policy.ShellLint do
       and active TTL leases.
   """
 
-  alias Noctilucent.Policy.Ast.Elixir, as: ElixirAst
-  alias Noctilucent.Policy.Ast.{PowerShell, Python}
+  alias Clearance.Lint.Ast.Elixir, as: ElixirAst
+  alias Clearance.Lint.Ast.{PowerShell, Python}
 
   @type verdict :: :ok | :ask | :deny
   @type risk :: :low | :high | :critical

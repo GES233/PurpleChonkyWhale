@@ -1,4 +1,4 @@
-defmodule Noctilucent.Policy.Ast.Worker do
+defmodule Clearance.Lint.Ast.Worker do
   @moduledoc """
   Lazy, persistent stdio Port worker for read-only external AST parsers
   (PowerShell `.NET Parser::ParseInput` and Python `ast.parse`).

@@ -1,7 +1,7 @@
-defmodule Noctilucent.Policy.TargetRules do
+defmodule Clearance.Lint.TargetRules do
   @moduledoc """
-  Shared target-path classification for `Noctilucent.Policy` static analyzers
-  (`ShellLint` and the Elixir / PowerShell / Python AST inspectors).
+  Shared target-path classification for the `Clearance.Lint` static analyzers
+  (the regex rules and the Elixir / PowerShell / Python AST inspectors).
 
   Identifies filesystem roots, OS system directories, the host user's home
   directory and sensitive subdirectories/dotfiles, credential stores, and

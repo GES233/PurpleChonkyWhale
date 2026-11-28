@@ -1,9 +1,9 @@
-defmodule Noctilucent.Policy.Ast.PowerShell do
+defmodule Clearance.Lint.Ast.PowerShell do
   @moduledoc """
   PowerShell AST static risk analyzer backed by .NET's built-in
   `[System.Management.Automation.Language.Parser]::ParseInput/3`.
 
-  A lazy persistent `Noctilucent.Policy.Ast.Worker` runs a strictly read-only
+  A lazy persistent `Clearance.Lint.Ast.Worker` runs a strictly read-only
   PowerShell script that **only** parses input into an AST and emits structural
   JSON facts (assignments, commands, pipelines, .NET member invocations, file
   redirections, and parse errors) — user code is **never** evaluated.
@@ -16,8 +16,8 @@ defmodule Noctilucent.Policy.Ast.PowerShell do
   eliminating false positives from comments and string literals.
   """
 
-  alias Noctilucent.Policy.Ast.Worker
-  alias Noctilucent.Policy.TargetRules
+  alias Clearance.Lint.Ast.Worker
+  alias Clearance.Lint.TargetRules
 
   @worker_name __MODULE__.Worker
 
@@ -328,7 +328,7 @@ defmodule Noctilucent.Policy.Ast.PowerShell do
   }
   """
 
-  @doc "Child options for `Noctilucent.Policy.Ast.Worker` in `Noctilucent.Supervisor`."
+  @doc "Child options for `Clearance.Lint.Ast.Worker` in `Clearance.Supervisor`."
   @spec worker_opts() :: keyword()
   def worker_opts do
     [

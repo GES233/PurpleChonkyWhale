@@ -1,4 +1,4 @@
-defmodule Noctilucent.Policy.Ast.Elixir do
+defmodule Clearance.Lint.Ast.Elixir do
   @moduledoc """
   Native BEAM AST static risk analyzer for `execute` calls using the
   `"elixir_subprocess"` or `"elixir"` runtimes.
@@ -18,7 +18,8 @@ defmodule Noctilucent.Policy.Ast.Elixir do
   accurately. Syntax errors fail closed to `:ask`.
   """
 
-  alias Noctilucent.Policy.{ShellLint, TargetRules}
+  alias Clearance.Lint
+  alias Clearance.Lint.TargetRules
 
   @destructive_file_funs %{
     File => [:rm, :rm!, :rm_rf, :rm_rf!, :rmdir, :rmdir!],
@@ -376,7 +377,7 @@ defmodule Noctilucent.Policy.Ast.Elixir do
 
       case extract_embedded_command(mod, fun, args, env) do
         {:ok, cmd_text} ->
-          nested = ShellLint.inspect_shell_text(cmd_text, protected_dirs: acc.protected_dirs)
+          nested = Lint.inspect_shell_text(cmd_text, protected_dirs: acc.protected_dirs)
 
           case nested.verdict do
             :deny ->

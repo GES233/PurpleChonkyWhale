@@ -17,8 +17,7 @@ defmodule Noctilucent.MixProject do
 
   def application do
     [
-      extra_applications: [:logger],
-      mod: {Noctilucent.Application, []}
+      extra_applications: [:logger]
     ]
   end
 

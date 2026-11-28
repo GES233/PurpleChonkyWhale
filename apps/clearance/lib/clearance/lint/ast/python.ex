@@ -1,9 +1,9 @@
-defmodule Noctilucent.Policy.Ast.Python do
+defmodule Clearance.Lint.Ast.Python do
   @moduledoc """
   Python AST static risk analyzer backed by Python's standard library
   `ast.parse/1`.
 
-  A lazy persistent `Noctilucent.Policy.Ast.Worker` runs a strictly read-only
+  A lazy persistent `Clearance.Lint.Ast.Worker` runs a strictly read-only
   Python script that **only** parses input into an AST and emits structural
   JSON facts (imports, resolved calls, receiver paths, and syntax errors) —
   user code is **never** executed.
@@ -16,8 +16,9 @@ defmodule Noctilucent.Policy.Ast.Python do
   network modules while avoiding false positives in comments and strings.
   """
 
-  alias Noctilucent.Policy.Ast.Worker
-  alias Noctilucent.Policy.{ShellLint, TargetRules}
+  alias Clearance.Lint.Ast.Worker
+  alias Clearance.Lint
+  alias Clearance.Lint.TargetRules
 
   @worker_name __MODULE__.Worker
 
@@ -294,7 +295,7 @@ defmodule Noctilucent.Policy.Ast.Python do
       sys.stdout.flush()
   """
 
-  @doc "Child options for `Noctilucent.Policy.Ast.Worker` in `Noctilucent.Supervisor`."
+  @doc "Child options for `Clearance.Lint.Ast.Worker` in `Clearance.Supervisor`."
   @spec worker_opts() :: keyword()
   def worker_opts do
     [
@@ -570,7 +571,7 @@ defmodule Noctilucent.Policy.Ast.Python do
 
       case args do
         [cmd_text | _] when is_binary(cmd_text) ->
-          nested = ShellLint.inspect_shell_text(cmd_text, protected_dirs: acc.protected_dirs)
+          nested = Lint.inspect_shell_text(cmd_text, protected_dirs: acc.protected_dirs)
 
           case nested.verdict do
             :deny ->

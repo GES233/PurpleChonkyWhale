@@ -7,7 +7,7 @@ defmodule Noctilucent.Policy do
   that is genuinely a Noctilucent choice:
 
     * the shell / PowerShell / Python / Elixir static analysis
-      (`Noctilucent.Policy.ShellLint`), wired in as `Clearance`'s `:lint` for
+      (`Clearance.Lint`), wired in as `Clearance`'s `:lint` for
       the `execute` tool
     * `runtime: "elixir"` always asks, because that runtime evaluates inside
       this BEAM with no isolation
@@ -24,7 +24,7 @@ defmodule Noctilucent.Policy do
   use Dexterous.Component, provide: [:policy]
 
   alias Dexterous.Context
-  alias Noctilucent.Policy.ShellLint
+  alias Clearance.Lint
 
   @default_auto_allow [:fs_read, :ui, :memory]
   @default_lease_ttl_ms 15 * 60_000
@@ -89,7 +89,7 @@ defmodule Noctilucent.Policy do
       initial_leases: Keyword.get(config, :initial_leases, []),
       protected_dirs:
         derive_protected_dirs(Keyword.get(config, :home), Keyword.get(config, :protected_dirs)),
-      lint: &ShellLint.inspect/2,
+      lint: &Lint.inspect/2,
       lint_tools: ["execute"],
       force_ask?: &force_ask?/3
     ]
