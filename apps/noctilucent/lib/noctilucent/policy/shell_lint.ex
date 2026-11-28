@@ -2,6 +2,19 @@ defmodule Noctilucent.Policy.ShellLint do
   @moduledoc """
   Static risk inspection for `execute` calls before they run or prompt.
 
+  Dispatches by `runtime` so languages with built-in parsers are inspected
+  structurally via AST rather than flat regex:
+
+    * `"elixir"` / `"elixir_subprocess"` — `Noctilucent.Policy.Ast.Elixir`
+      (native `Code.string_to_quoted/2` inside BEAM).
+    * `"powershell"` — `Noctilucent.Policy.Ast.PowerShell` (.NET
+      `Parser::ParseInput` via a lazy read-only Port worker, failing closed to
+      regex + `:ask` if unavailable).
+    * `"python"` — `Noctilucent.Policy.Ast.Python` (stdlib `ast.parse` via a
+      lazy read-only Port worker, failing closed to regex + `:ask` if
+      unavailable).
+    * `"shell"` (and any other runtime) — static regex rules below.
+
   Classifies an `execute` call into one of three verdicts:
 
     * `:deny` (`:critical`) — catastrophic or self-destructive patterns that must
@@ -18,9 +31,18 @@ defmodule Noctilucent.Policy.ShellLint do
       and active TTL leases.
   """
 
+  alias Noctilucent.Policy.Ast.Elixir, as: ElixirAst
+  alias Noctilucent.Policy.Ast.{PowerShell, Python}
+
   @type verdict :: :ok | :ask | :deny
   @type risk :: :low | :high | :critical
-  @type assessment :: %{verdict: verdict(), risk: risk(), reasons: [String.t()]}
+  @type analyzer :: :ast_elixir | :ast_powershell | :ast_python | :regex | :regex_fallback
+  @type assessment :: %{
+          verdict: verdict(),
+          risk: risk(),
+          reasons: [String.t()],
+          analyzer: analyzer()
+        }
 
   @destructive_verb_re ~r/\b(?:rm|rmdir|rd|del|erase|Remove-Item|ri|Clear-Content|Move-Item|File\.rm_rf|File\.rm|shutil\.rmtree|os\.remove|os\.unlink)\b/i
   @exfil_verb_re ~r/\b(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|iwr|irm|nc|ncat|scp)\b/i
@@ -36,24 +58,92 @@ defmodule Noctilucent.Policy.ShellLint do
 
   def inspect(%{"code" => code} = args, opts) when is_binary(code) do
     runtime = Map.get(args, "runtime", "shell")
-    protected_dirs = opts |> Access.get(:protected_dirs, []) |> List.wrap()
 
+    case runtime do
+      rt when rt in ["elixir", "elixir_subprocess"] ->
+        ElixirAst.inspect(code, rt, opts)
+
+      "powershell" ->
+        case PowerShell.inspect(code, opts) do
+          {:ok, assessment} ->
+            assessment
+
+          {:error, _reason} ->
+            regex_fallback(
+              code,
+              runtime,
+              opts,
+              "PowerShell AST parser unavailable; fell back to static regex"
+            )
+        end
+
+      "python" ->
+        case Python.inspect(code, opts) do
+          {:ok, assessment} ->
+            assessment
+
+          {:error, _reason} ->
+            regex_fallback(
+              code,
+              runtime,
+              opts,
+              "Python AST parser unavailable; fell back to static regex"
+            )
+        end
+
+      _other ->
+        inspect_regex(code, runtime, opts, :regex)
+    end
+  end
+
+  def inspect(_args, _opts), do: %{verdict: :ok, risk: :low, reasons: [], analyzer: :regex}
+
+  @doc """
+  Inspect a raw shell command string using the regex ruleset (used directly for
+  `"shell"` calls and recursively by AST analyzers for embedded shell commands
+  passed to `System.cmd/2` or `subprocess.run/1`).
+  """
+  @spec inspect_shell_text(String.t(), keyword() | map()) :: assessment()
+  def inspect_shell_text(code, opts \\ []) when is_binary(code) do
+    inspect_regex(code, "shell", opts, :regex)
+  end
+
+  defp regex_fallback(code, runtime, opts, fallback_note) do
+    base = inspect_regex(code, runtime, opts, :regex_fallback)
+
+    case base.verdict do
+      :deny ->
+        base
+
+      :ask ->
+        %{base | reasons: Enum.uniq(base.reasons ++ [fallback_note])}
+
+      :ok ->
+        %{
+          verdict: :ask,
+          risk: :high,
+          reasons: [fallback_note],
+          analyzer: :regex_fallback
+        }
+    end
+  end
+
+  defp inspect_regex(code, runtime, opts, analyzer) do
+    protected_dirs = opts |> Access.get(:protected_dirs, []) |> List.wrap()
     deny_reasons = deny_reasons(code, runtime, protected_dirs)
 
     if deny_reasons != [] do
-      %{verdict: :deny, risk: :critical, reasons: Enum.uniq(deny_reasons)}
+      %{verdict: :deny, risk: :critical, reasons: Enum.uniq(deny_reasons), analyzer: analyzer}
     else
       ask_reasons = ask_reasons(code, runtime)
 
       if ask_reasons != [] do
-        %{verdict: :ask, risk: :high, reasons: Enum.uniq(ask_reasons)}
+        %{verdict: :ask, risk: :high, reasons: Enum.uniq(ask_reasons), analyzer: analyzer}
       else
-        %{verdict: :ok, risk: :low, reasons: []}
+        %{verdict: :ok, risk: :low, reasons: [], analyzer: analyzer}
       end
     end
   end
-
-  def inspect(_args, _opts), do: %{verdict: :ok, risk: :low, reasons: []}
 
   ## Hard-deny rules (unconditional floor)
 
