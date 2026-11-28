@@ -131,14 +131,18 @@ defmodule PurpleChonkyWhale.Tools.SearchTest do
 
   describe "grep" do
     test "finds matching lines as path:line:text, pruning ignored dirs", %{env: env} do
-      assert {:ok, "lib/a.ex:2:  # alpha\nlib/notes.txt:1:alpha delta"} =
+      assert {:ok,
+              "lib/a.ex:2:  # alpha\nlib/notes.txt:1:alpha delta\n" <>
+                "(skipped 1 file: bin/data.bin looks binary)"} =
                Grep.execute(%{"pattern" => "alpha"}, env)
     end
 
     test "options make the search case-insensitive", %{env: env} do
       assert {:ok, "(no matches in " <> _} = Grep.execute(%{"pattern" => "beta"}, env)
 
-      assert {:ok, "lib/nested/b.ex:2:  # Beta"} =
+      assert {:ok,
+              "lib/nested/b.ex:2:  # Beta\n" <>
+                "(skipped 1 file: bin/data.bin looks binary)"} =
                Grep.execute(%{"pattern" => "beta", "options" => "i"}, env)
     end
 
@@ -161,16 +165,31 @@ defmodule PurpleChonkyWhale.Tools.SearchTest do
       assert {:ok, _} = Grep.execute(%{"pattern" => "alpha", "max_file_bytes" => 10_000}, env)
     end
 
+    test "names every skipped file and the reason instead of swallowing them", %{env: env} do
+      assert {:ok, output} = Grep.execute(%{"pattern" => "alpha", "max_file_bytes" => 3}, env)
+
+      assert output =~ "(no matches in "
+      assert output =~ "(skipped 4 files:"
+      assert output =~ "bin/data.bin is 5 B, over the 3 B limit"
+      assert output =~ "lib/notes.txt is 12 B, over the 3 B limit"
+    end
+
     test "caps the output at the limit", %{env: env} do
       assert {:ok, output} = Grep.execute(%{"pattern" => "alpha", "limit" => 1}, env)
-      assert output == "lib/a.ex:2:  # alpha\n... (capped at 1 matching lines)"
+
+      assert output ==
+               "lib/a.ex:2:  # alpha\n... (capped at 1 matching lines)\n" <>
+                 "(skipped 1 file: bin/data.bin looks binary — scan stopped at the " <>
+                 "match cap, so this list is partial)"
     end
 
     test "truncates long lines", %{env: env} do
       File.write!(Path.join(env.cwd, "lib/long.txt"), String.duplicate("x", 50) <> " needle")
 
-      assert {:ok, "lib/long.txt:1:xxxxxxxxxx..."} =
-               Grep.execute(%{"pattern" => "needle", "max_line_chars" => 10}, env)
+      assert {:ok, output} = Grep.execute(%{"pattern" => "needle", "max_line_chars" => 10}, env)
+
+      assert output ==
+               "lib/long.txt:1:xxxxxxxxxx...\n(skipped 1 file: bin/data.bin looks binary)"
     end
 
     test "surfaces bad patterns and bad paths as errors", %{env: env} do
