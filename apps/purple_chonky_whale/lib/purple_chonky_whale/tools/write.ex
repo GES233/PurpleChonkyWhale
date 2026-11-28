@@ -2,11 +2,18 @@ defmodule PurpleChonkyWhale.Tools.Write do
   @moduledoc """
   The `write` tool: create a file or completely overwrite an existing one,
   creating parent directories as needed.
+
+  Overwriting is a whole-file replacement by definition, so there is nothing to
+  detect here — but it is atomic (`PurpleChonkyWhale.Tools.AtomicFile`), so a
+  concurrent reader sees either the old file or the new one. Concurrent writes
+  to one path are serialized by the `:tools` seam; two processes writing the
+  same file directly are last-writer-wins.
   """
 
   @behaviour PurpleChonkyWhale.Tool
 
   alias PurpleChonkyWhale.Tool
+  alias PurpleChonkyWhale.Tools.AtomicFile
 
   @impl true
   def capabilities, do: [:fs_write]
@@ -35,7 +42,7 @@ defmodule PurpleChonkyWhale.Tools.Write do
 
     with {:ok, path} <- Tool.authorize_path(env, args["file_path"], :write),
          :ok <- mkdir_p(Path.dirname(path)),
-         :ok <- write_file(path, content) do
+         :ok <- AtomicFile.write(path, content) do
       lines = content |> String.split("\n") |> length()
       {:ok, "wrote #{lines} lines to #{path}"}
     end
@@ -43,15 +50,11 @@ defmodule PurpleChonkyWhale.Tools.Write do
 
   defp mkdir_p(dir) do
     case File.mkdir_p(dir) do
-      :ok -> :ok
-      {:error, reason} -> {:error, "cannot create directory #{dir}: #{:file.format_error(reason)}"}
-    end
-  end
+      :ok ->
+        :ok
 
-  defp write_file(path, content) do
-    case File.write(path, content) do
-      :ok -> :ok
-      {:error, reason} -> {:error, "cannot write #{path}: #{:file.format_error(reason)}"}
+      {:error, reason} ->
+        {:error, "cannot create directory #{dir}: #{:file.format_error(reason)}"}
     end
   end
 end

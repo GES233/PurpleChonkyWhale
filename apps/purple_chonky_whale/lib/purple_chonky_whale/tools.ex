@@ -58,6 +58,23 @@ defmodule PurpleChonkyWhale.Tools do
 
   Results are typed: `{:ok, output}` or `{:error, %{type:, message:}}` with
   `:type` one of `:unknown_tool | :denied | :crashed`.
+
+  ## Write serialization
+
+  A batch of tool calls runs concurrently, while the file-writing tools are
+  read-modify-write over the whole file: two of them against one path read the
+  same bytes, each writes its own version back, and the last writer erases the
+  other's change while both report success. A call whose module declares
+  `:fs_write` therefore runs under a per-target lock (`:global.trans`, this
+  node) taken from `PurpleChonkyWhale.Tool.write_target/3` — the tool's own
+  declaration, falling back to `file_path`/`path` in its arguments. Calls to
+  different files still run in parallel; a tool that declares `:none` is not
+  serialized.
+
+  The guarantee is scoped to calls through this seam: two processes writing the
+  same file directly (a script, an editor, another agent) are outside it, which
+  is why `PurpleChonkyWhale.Tools.Edit` additionally re-checks its snapshot
+  before writing.
   """
 
   use Dexterous.Component, provide: [:tools]
@@ -376,13 +393,13 @@ defmodule PurpleChonkyWhale.Tools do
         case call.decision do
           {:allow, %Grant{} = grant} ->
             if Grant.allows?(grant, call.name, caps) do
-              run_module(module, call, Grant.apply_to_env(grant, env), ctx)
+              run_guarded(module, call, Grant.apply_to_env(grant, env), ctx)
             else
               {:error, %{type: :denied, message: denial_message(grant, call.name, caps)}}
             end
 
           :run when not registry.require_grant? ->
-            run_module(module, call, env, ctx)
+            run_guarded(module, call, env, ctx)
 
           :run ->
             {:error,
@@ -418,6 +435,76 @@ defmodule PurpleChonkyWhale.Tools do
 
         "denied: grant missing required capabilities #{inspect(missing)} for #{name}"
     end
+  end
+
+  # `AgentLoop` runs a batch of tool calls concurrently, but the file-writing
+  # tools are read-modify-write over the whole file: two of them against one
+  # path read the same bytes, each writes its own version back, and the last
+  # writer silently erases the other's change while both report success. The
+  # seam serializes them, keyed on the *path* so writes to different files still
+  # run in parallel.
+  #
+  # The path comes from the tool (`Tool.write_target/3`), not from this module
+  # guessing argument names: a tool whose arguments do not spell `file_path` or
+  # `path` declares its target, and one that writes several files returns
+  # `:none` and opts out.
+  defp run_guarded(module, call, env, ctx) do
+    if :fs_write in Tool.capabilities(module) do
+      with_write_lock(module, call.arguments, env, fn -> run_module(module, call, env, ctx) end)
+    else
+      run_module(module, call, env, ctx)
+    end
+  end
+
+  defp with_write_lock(module, args, env, fun) do
+    case lock_id(module, args, env) do
+      nil ->
+        fun.()
+
+      id ->
+        case :global.trans(id, fun, [node()]) do
+          :aborted ->
+            {:error,
+             %{
+               type: :crashed,
+               message: "could not acquire the write lock for #{format_lock(id)}"
+             }}
+
+          result ->
+            result
+        end
+    end
+  end
+
+  defp lock_id(module, args, env) do
+    case Tool.write_target(module, args, env) do
+      {:ok, path} -> lock_key(path, env)
+      :none -> nil
+    end
+  end
+
+  defp format_lock({{_module, _kind, path}, _requester}), do: path
+
+  # Canonical physical path, so `./a.txt`, `a.txt` and a symlink to it contend
+  # for the same lock; case-folded on Windows, where `A.TXT` and `a.txt` are one
+  # file.
+  defp lock_key(path, env) do
+    base = env[:cwd] || File.cwd!()
+    expanded = Path.expand(path, base)
+
+    canonical =
+      case PurpleChonkyWhale.Security.PathGuard.realpath(expanded) do
+        {:ok, resolved} -> resolved
+        {:error, _} -> expanded
+      end
+
+    canonical =
+      case :os.type() do
+        {:win32, _} -> String.downcase(canonical)
+        _ -> canonical
+      end
+
+    {{__MODULE__, :write, canonical}, self()}
   end
 
   defp run_module(module, call, env, ctx) do

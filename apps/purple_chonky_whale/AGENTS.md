@@ -112,7 +112,11 @@ temp file).
   registry, lifetime bound to the composition via `Context.track/2`, like
   `Sessions`) and merges their generated tool modules into the registry; a
   static tool wins a name collision (with a warning). The `%Tools{}` handle
-  keeps the `%MCP{}` in its `:mcp` field.
+  keeps the `%MCP{}` in its `:mcp` field. Calls whose module declares
+  `:fs_write` are serialized per write target (`Tool.write_target/3`: the
+  tool's own `write_target/2`, else `file_path`/`path`) so concurrent edits of
+  one file cannot erase each other; `Tools.Edit`/`Tools.Write` replace files
+  atomically (`Tools.AtomicFile`, temp + rename).
 - `MCP` — MCP servers as a tool source (internal, not a seam): connects to
   each declared server via Anubis, lists its tools and `Module.create/3`s a
   self-contained `Tool` module per tool, named `mcp_<server>_<tool>`

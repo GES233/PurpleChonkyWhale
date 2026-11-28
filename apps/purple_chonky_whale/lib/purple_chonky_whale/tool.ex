@@ -53,7 +53,18 @@ defmodule PurpleChonkyWhale.Tool do
   @callback schema() :: schema()
   @callback execute(args :: map(), env()) :: {:ok, term()} | {:error, term()}
   @callback capabilities() :: [capability()]
-  @optional_callbacks capabilities: 0
+
+  @doc """
+  The file a call will write, in the tool's own argument vocabulary.
+
+  The `:tools` seam serializes concurrent write calls on one target (see
+  `PurpleChonkyWhale.Tools`), which it can only do for a path it can name: a
+  tool whose arguments do not use `file_path` or `path` must implement this to
+  be serialized. Return `:none` for a call with no single target.
+  """
+  @callback write_target(args :: map(), env()) :: {:ok, Path.t()} | :none
+
+  @optional_callbacks capabilities: 0, write_target: 2
 
   alias PurpleChonkyWhale.Security.PathGuard
 
@@ -103,4 +114,36 @@ defmodule PurpleChonkyWhale.Tool do
   def authorize_path(env, path, access) when access in [:read, :write] do
     PathGuard.authorize(env, path, access)
   end
+
+  @doc """
+  The write target `module` declares for a call, or `:none`.
+
+  Prefers the tool's own `write_target/2` when it exports one, and otherwise
+  infers `file_path` (then `path`) from the arguments. An invalid declaration
+  falls back to inference: locking a call that did not need it is harmless,
+  skipping one that did is not.
+  """
+  @spec write_target(module(), map(), env()) :: {:ok, String.t()} | :none
+  def write_target(module, args, env) when is_atom(module) and is_map(args) do
+    if Code.ensure_loaded?(module) and function_exported?(module, :write_target, 2) do
+      case module.write_target(args, env) do
+        {:ok, path} when is_binary(path) and path != "" -> {:ok, path}
+        :none -> :none
+        _invalid -> default_write_target(args)
+      end
+    else
+      default_write_target(args)
+    end
+  end
+
+  @doc "Infer the write target from `file_path` or `path` in `args`."
+  @spec default_write_target(map()) :: {:ok, String.t()} | :none
+  def default_write_target(args) when is_map(args) do
+    case args["file_path"] || args["path"] do
+      path when is_binary(path) and path != "" -> {:ok, path}
+      _ -> :none
+    end
+  end
+
+  def default_write_target(_args), do: :none
 end

@@ -12,11 +12,31 @@ defmodule PurpleChonkyWhale.Tools.Edit do
   When exact matching finds nothing, a fallback retry ignores trailing
   whitespace per line; the replacement splices only the matched lines,
   leaving the rest of the file byte-identical.
+
+  ## What an edit guarantees
+
+    * **Mutual exclusion** (strong): calls that go through the `:tools` seam
+      are serialized per target path, so within one VM two edits of the same
+      file never interleave their read-modify-write cycles.
+    * **Atomic replacement** (strong): the new bytes are written to a temp file
+      and renamed over the target, so a reader sees the complete old file or
+      the complete new one, and a crash mid-write leaves the file untouched.
+    * **External-change detection** (best effort): the bytes the edit was
+      computed from are re-read just before writing; a mismatch is refused
+      rather than silently overwritten. This is *detection*, not exclusion — a
+      writer that changes the file inside the window between that re-read and
+      the rename still wins. That is the file system's semantics, not a bug:
+      two concurrent edits that both bypass the seam can still lose one.
+
+  `env[:edit_hook]` — an optional `(path, original_bytes -> any())` called
+  immediately before the re-read — exists so a test can play the part of an
+  external writer and make that detection fire deterministically.
   """
 
   @behaviour PurpleChonkyWhale.Tool
 
   alias PurpleChonkyWhale.Tool
+  alias PurpleChonkyWhale.Tools.AtomicFile
 
   @bom "\xEF\xBB\xBF"
 
@@ -60,7 +80,8 @@ defmodule PurpleChonkyWhale.Tools.Edit do
         with {:ok, path} <- Tool.authorize_path(env, file_path, :write),
              {:ok, raw} <- read(path),
              {:ok, edited, note} <- replace_preserving(raw, old, new),
-             :ok <- File.write(path, edited) do
+             :ok <- check_unchanged(path, raw, env),
+             :ok <- AtomicFile.write(path, edited) do
           {:ok, "edited #{path}" <> note}
         end
     end
@@ -77,6 +98,41 @@ defmodule PurpleChonkyWhale.Tools.Edit do
       {:error, reason} -> {:error, "cannot read #{path}: #{:file.format_error(reason)}"}
     end
   end
+
+  # The `:tools` seam serializes concurrent writes to one path, but that cannot
+  # stop another process — an editor, a test, a sibling agent — from rewriting
+  # the file between our read and our write. Re-read and compare against the
+  # bytes the edit was computed from: a whole-file write must never silently
+  # discard a change it never saw. This narrows the window, it does not close
+  # it (see the moduledoc); the rename in `AtomicFile.write/2` is what makes the
+  # write itself all-or-nothing.
+  defp check_unchanged(path, original, env) do
+    fire_edit_hook(env, path, original)
+
+    case File.read(path) do
+      {:ok, ^original} ->
+        :ok
+
+      {:ok, _changed} ->
+        {:error, "#{path} changed while the edit was prepared; re-read it and retry"}
+
+      {:error, reason} ->
+        {:error, "cannot re-read #{path}: #{:file.format_error(reason)}"}
+    end
+  end
+
+  defp fire_edit_hook(env, path, original) when is_map(env) or is_list(env) do
+    case Access.get(env, :edit_hook) do
+      fun when is_function(fun, 2) ->
+        _ = fun.(path, original)
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp fire_edit_hook(_env, _path, _original), do: :ok
 
   ## The line-ending-aware replace
 
