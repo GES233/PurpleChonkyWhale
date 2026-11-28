@@ -21,10 +21,10 @@ defmodule Clearance do
 
   Mount `Clearance.Component` as a composition entry (it provides `:policy`),
   or start `Clearance.Policy` yourself and attach `listener/1` to the
-  `:"tools/pre-execute"` waterfall:
+  `:"tools/pre-execute"` waterfall of an existing composition:
 
       {:ok, policy} = Clearance.Policy.start_link(asker: &MyApp.ask/1)
-      Tools.with_listener(:"tools/pre-execute", Clearance.listener(policy))
+      {:ok, _disposer} = Context.on(ctx, :"tools/pre-execute", Clearance.listener(policy))
 
   A headless application passes `Clearance.Asker.DenyAll` (or its own asker)
   and keeps the same lease semantics as an interactive one.

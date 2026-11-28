@@ -20,23 +20,14 @@ stays generic.
   models fail open). `:mcp_servers`, `:policy_opts`, and `:sandbox_opts` pass
   through to their entries. Persona isolation falls out of the composition:
   separate session dirs, tool sets, policy leases, sandbox configs and scopes.
-- `Noctilucent.Policy` / `Noctilucent.Policy.ShellLint` / `Noctilucent.Policy.Ast.*` —
-  application-level permission policy component (`provide: [:policy]`) hooked
-  onto `tools/pre-execute`. `ShellLint` dispatches by runtime: Elixir
-  (`"elixir"` / `"elixir_subprocess"`) uses native `Code.string_to_quoted/2`
-  (`Ast.Elixir`); PowerShell uses .NET `Parser::ParseInput` (`Ast.PowerShell`)
-  and Python uses stdlib `ast.parse` (`Ast.Python`) through lazy, read-only
-  persistent stdio Port workers (`Ast.Worker`, supervised under
-  `Noctilucent.Supervisor`, failing closed to regex + `:ask` if unavailable);
-  `"shell"` uses static regex. All analyzers share `TargetRules` to block
-  catastrophic commands (`$home = ...` including scoped/destructured forms,
-  root/home/protected_dirs wipes, pipe-to-shell, `.NET`/Python/Elixir home or
-  credential destruction) while avoiding false positives in comments/strings,
-  and escalate high-risk or dynamic operations (`rm -rf`, `git reset --hard`,
-  network/install, dynamic eval/invocation, `ErrorActionPreference` overrides,
-  `runtime: "elixir"`) to one-shot confirmation. `Policy` auto-allows
-  `[:fs_read, :ui, :memory]`, manages bounded TTL capability leases
-  (`%Security.Grant{}`), and serializes concurrent interactive approval prompts.
+- `Noctilucent.Policy` — the `:policy` component (`provide: [:policy]`) and a
+  thin adapter over `apps/clearance`. It starts `Clearance.Policy` with this
+  app's opinions only: the shared `Clearance.Lint` analyzers for `execute`,
+  `runtime: "elixir"` forced to ask (it evaluates in this BEAM), protected
+  dirs derived from the persona `home`, and the CLI's `:ask` option mapped to
+  Clearance's `:asker`. The ladder, leases, prompt serialization and the
+  shell/AST rules live in `apps/clearance`; mount `Clearance.Component`
+  directly when you want a different asker.
 - `Noctilucent.CLI` — the terminal REPL (`mix noctilucent`, see
   `lib/mix/tasks/noctilucent.ex`). Multi-turn over one session log, slash
   commands `/quit` `/cancel` `/steer` `/reset` `/sessions` `/resume` `/log`

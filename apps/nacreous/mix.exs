@@ -24,7 +24,8 @@ defmodule Nacreous.MixProject do
 
   defp deps do
     [
-      {:purple_chonky_whale, in_umbrella: true}
+      {:purple_chonky_whale, in_umbrella: true},
+      {:clearance, in_umbrella: true}
     ]
   end
 end
