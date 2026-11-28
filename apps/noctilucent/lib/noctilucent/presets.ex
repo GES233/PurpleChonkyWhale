@@ -122,7 +122,7 @@ defmodule Noctilucent.Presets do
         component: Policy,
         config:
           Keyword.merge(
-            [persona: persona, cwd: cwd, home: home, protected_dirs: protected],
+            [home: home, protected_dirs: protected],
             policy_opts
           )
       }

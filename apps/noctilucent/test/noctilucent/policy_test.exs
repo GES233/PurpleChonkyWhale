@@ -49,7 +49,7 @@ defmodule Noctilucent.PolicyTest do
       )
 
     {:ok, _} =
-      Context.use(ctx, Policy, Keyword.merge([cwd: dir], policy_opts))
+      Context.use(ctx, Policy, policy_opts)
 
     tools = await_binding(ctx, :tools)
     policy = await_binding(ctx, :policy)
